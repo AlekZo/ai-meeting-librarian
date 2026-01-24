@@ -28,6 +28,10 @@ The **Auto-Meeting Video Renamer** is a Windows background utility that automati
 - **Offline Mode**: Automatically queues files when internet is unavailable and processes them when connection is restored
 - **Persistent Interactions**: Telegram callback buttons survive app restarts via JSON storage
 - **OS-Level File Safety**: Uses Windows-specific file handle checks to ensure recordings are finished before processing
+- **Google Sheets Logging**: Automatically logs meeting details, project tags, and links to a Google Sheet
+- **AI Project Classification**: Uses OpenRouter (Gemini) to automatically categorize meetings into projects based on transcripts
+- **Interactive Speaker Identification**: Identifies speakers via AI and allows manual renaming/swapping via Telegram buttons
+- **Drive Integration**: Automatically uploads meeting transcripts to Google Drive and links them in the spreadsheet
 - **Configuration File**: Easy-to-customize JSON config
 - **Virtual Environment**: Isolated Python environment with all dependencies
 

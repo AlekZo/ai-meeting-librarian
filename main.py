@@ -517,26 +517,131 @@ class AutoMeetingVideoRenamer:
                 "state": "awaiting_name",
                 "job_id": job_id,
                 "speaker_id": speaker_id,
-                "file_name": file_name
+                "file_name": file_name,
+                "current_name": current_name
             }
 
             # Ask for the new name using ForceReply
             self.uploader._send_telegram_notification(
-                f"What is the real name for **{current_name}**?",
+                f"What is the real name for **{speaker_id}** (currently '{current_name}')?",
                 reply_markup={"force_reply": True, "selective": True}
             )
+
+        elif cb_data["action"] == "confirm_rename":
+            job_id = cb_data["job_id"]
+            speaker_id = cb_data["speaker_id"]
+            new_name = cb_data["new_name"]
+            
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            
+            # Update Scriberr
+            mapping = {"original_speaker": speaker_id, "custom_name": new_name}
+            success = self.uploader._update_scriberr_speakers(job_id, [mapping])
+            
+            if success:
+                self.uploader._send_telegram_notification(f"✅ Updated **{speaker_id}** to **{new_name}**")
+            else:
+                self.uploader._send_telegram_notification(f"❌ Failed to update speaker for job {job_id}")
+
+        elif cb_data["action"] == "offer_swap":
+            job_id = cb_data["job_id"]
+            speakers = cb_data["speakers"]
+            display_map = cb_data["display_map"]
+            file_name = cb_data["file_name"]
+            
+            # Create buttons for each pair
+            keyboard = []
+            import itertools
+            for s1, s2 in itertools.combinations(speakers, 2):
+                name1 = display_map.get(s1, s1)
+                name2 = display_map.get(s2, s2)
+                cb_id = f"swp_{int(time.time())}_{s1}_{s2}"
+                self.callback_map[cb_id] = {
+                    "action": "confirm_swap",
+                    "job_id": job_id,
+                    "s1": s1,
+                    "s2": s2,
+                    "name1": name1,
+                    "name2": name2
+                }
+                keyboard.append([{"text": f"🔄 {name1} ↔️ {name2}", "callback_data": cb_id}])
+            
+            self.uploader._send_telegram_notification(
+                f"Select two speakers to swap names for {file_name}:",
+                reply_markup={"inline_keyboard": keyboard}
+            )
+
+        elif cb_data["action"] == "confirm_swap":
+            job_id = cb_data["job_id"]
+            s1, s2 = cb_data["s1"], cb_data["s2"]
+            name1, name2 = cb_data["name1"], cb_data["name2"]
+            
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            
+            # Swap: s1 gets name2, s2 gets name1
+            mappings = [
+                {"original_speaker": s1, "custom_name": name2},
+                {"original_speaker": s2, "custom_name": name1}
+            ]
+            success = self.uploader._update_scriberr_speakers(job_id, mappings)
+            
+            if success:
+                self.uploader._send_telegram_notification(f"✅ Swapped names: **{s1}** is now **{name2}**, **{s2}** is now **{name1}**")
+            else:
+                self.uploader._send_telegram_notification(f"❌ Failed to swap speakers for job {job_id}")
 
         elif cb_data["action"] == "speaker_assignment_done":
             job_id = cb_data["job_id"]
             file_name = cb_data["file_name"]
             transcript_data = cb_data.get("transcript_data")
             
+            # UI Cleanup: Replace the button menu with a processing message
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json_body={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": f"⏳ Processing final transcript for {file_name}..."
+                }
+            )
+            
+            # Requirement 3: Visual Mapping Table
+            # We need to fetch the current speakers from Scriberr to show the final mapping
+            try:
+                url = f"{self.uploader.base_url}/api/v1/transcription/{job_id}/speakers"
+                headers = {"X-API-Key": self.uploader.api_key}
+                response, speakers_data = request_json("GET", url, headers=headers)
+                
+                if response and response.status_code == 200 and speakers_data:
+                    # speakers_data is likely a list of {original_speaker, custom_name}
+                    table_lines = [f"📊 **Final Speaker Mapping for {file_name}:**"]
+                    # Handle both wrapped and unwrapped response
+                    mappings = speakers_data.get("mappings", speakers_data) if isinstance(speakers_data, dict) else speakers_data
+                    for entry in mappings:
+                        orig = entry.get("original_speaker", "Unknown")
+                        custom = entry.get("custom_name", orig)
+                        table_lines.append(f"• {orig} ➔ **{custom}**")
+                    self.uploader._send_telegram_notification("\n".join(table_lines))
+            except Exception as e:
+                logger.error(f"Failed to fetch final speaker mapping: {e}")
+
             self.uploader._send_telegram_notification(f"✅ Finalizing transcript for {file_name}...")
             
-            # Trigger transcript re-download and processing
+            # Trigger transcript re-download and processing with finalize=True
             if transcript_data:
                 # We need to re-fetch the transcript from Scriberr to get updated names
-                threading.Thread(target=self.uploader._download_transcript, args=(job_id, "manual_refresh", transcript_data)).start()
+                threading.Thread(target=self.uploader._download_transcript, args=(job_id, "manual_refresh", transcript_data, True)).start()
             else:
                 self.uploader._send_telegram_notification("⚠️ Could not refresh transcript automatically. Please check Scriberr.")
 
@@ -696,14 +801,28 @@ class AutoMeetingVideoRenamer:
             # Clear state
             del self.user_states[chat_id]
             
-            # Update Scriberr
-            mapping = {"original_speaker": speaker_id, "custom_name": new_name}
-            success = self.uploader._update_scriberr_speakers(job_id, [mapping])
+            # Requirement 3: Confirmation Prompt
+            cb_id_yes = f"conf_y_{int(time.time())}"
+            cb_id_no = f"conf_n_{int(time.time())}"
             
-            if success:
-                self.uploader._send_telegram_notification(f"✅ Updated **{speaker_id}** to **{new_name}**")
-            else:
-                self.uploader._send_telegram_notification(f"❌ Failed to update speaker for job {job_id}")
+            self.callback_map[cb_id_yes] = {
+                "action": "confirm_rename",
+                "job_id": job_id,
+                "speaker_id": speaker_id,
+                "new_name": new_name
+            }
+            self.callback_map[cb_id_no] = {"action": "skip", "file_path": "rename_cancel"}
+            self.callback_persistence.save(self.callback_map)
+
+            self.uploader._send_telegram_notification(
+                f"I will update **{speaker_id}** to **{new_name}**. Is this correct?",
+                reply_markup={
+                    "inline_keyboard": [[
+                        {"text": "✅ Yes", "callback_data": cb_id_yes},
+                        {"text": "❌ No", "callback_data": cb_id_no}
+                    ]]
+                }
+            )
             return
 
         if text.startswith("/name "):
@@ -870,7 +989,9 @@ class AutoMeetingVideoRenamer:
             meeting_time = (meeting_info or {}).get("meeting_time", "")
             meeting_name = (meeting_info or {}).get("meeting_name", "")
             video_source_link = (meeting_info or {}).get("video_source_link", "")
-            scribber_link = f"{self.uploader.base_url}/transcription/{job_id}"
+            if video_source_link:
+                video_source_link = f'=HYPERLINK("{video_source_link}", "Link")'
+            scribber_link = f"{self.uploader.base_url}/audio/{job_id}"
 
             item = {
                 "meeting_time": meeting_time,
@@ -895,7 +1016,7 @@ class AutoMeetingVideoRenamer:
                     "meeting_name": meeting_info.get("meeting_name", ""),
                     "project_tag": "",
                     "video_source_link": meeting_info.get("video_source_link", ""),
-                    "scribber_link": f"{self.uploader.base_url}/transcription/{job_id}",
+                    "scribber_link": f"{self.uploader.base_url}/audio/{job_id}",
                     "transcript_drive_link": "",
                     "status": "Failed",
                 }
@@ -931,17 +1052,29 @@ class AutoMeetingVideoRenamer:
 
         project_lines = [f"- {name}: {keywords}" for name, keywords in projects]
         prompt = (
-            "You are a classifier. Choose ONE project tag from the list below.\n"
-            "Return ONLY the project name string.\n\n"
-            "Projects:\n" + "\n".join(project_lines) +
-            "\n\nTranscript:\n" + transcript_text
+            "You are an expert meeting classifier. Your task is to assign the most relevant project tag "
+            "to the provided transcript based on the listed projects and their context keywords.\n\n"
+            "Rules:\n"
+            "1. Return ONLY the exact project name.\n"
+            "2. If no project clearly matches, return 'Uncategorized'.\n"
+            "3. Base your decision on the technical topics and clients mentioned.\n\n"
+            "Available Projects:\n" + "\n".join(project_lines) +
+            "\n\nTranscript Content:\n" + transcript_text
         )
 
         result = self.uploader._get_openrouter_response(prompt)
         if not result:
             return ""
+        
         # Basic cleanup
-        return str(result).strip().splitlines()[0]
+        tag = str(result).strip().splitlines()[0]
+        
+        # Validation: Ensure the tag exists in projects or is 'Uncategorized'
+        project_names = {name for name, _ in projects}
+        if tag in project_names or tag == "Uncategorized":
+            return tag
+            
+        return "Uncategorized"
 
 def signal_handler(signum, frame):
     """Handle system signals"""

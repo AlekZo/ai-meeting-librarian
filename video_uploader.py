@@ -202,7 +202,7 @@ class VideoUploader:
                     
                     if status == "completed":
                         logger.info(f"✅ Transcription completed for job {job_id}")
-                        scriberr_link = f"{self.base_url}/transcription/{job_id}"
+                        scriberr_link = f"{self.base_url}/audio/{job_id}"
                         self._send_telegram_notification(
                             f"✅ Transcription completed: {os.path.basename(original_file_path)}\n🔗 View on Scriberr: {scriberr_link}"
                         )
@@ -223,7 +223,7 @@ class VideoUploader:
                 logger.error(f"Error polling status for job {job_id}: {str(e)}")
                 time.sleep(10)
 
-    def _download_transcript(self, job_id, original_file_path, existing_transcript_data=None):
+    def _download_transcript(self, job_id, original_file_path, existing_transcript_data=None, finalize=False):
         url = f"{self.base_url}/api/v1/transcription/{job_id}/transcript"
         headers = {"X-API-Key": self.api_key}
         is_manual_refresh = original_file_path == "manual_refresh"
@@ -236,37 +236,50 @@ class VideoUploader:
                 logger.info(f"Cleaning transcript segments for job {job_id}")
                 transcript_data = self._clean_transcript_data(transcript_data)
                 
-                # Identify speakers using OpenRouter
-                logger.info(f"Starting speaker identification for job {job_id}")
-                identified_speakers = self._identify_speakers(transcript_data, job_id)
-                if identified_speakers:
-                    logger.info(f"Speakers identified: {identified_speakers}")
-                    updated = self._update_scriberr_speakers(job_id, identified_speakers)
-                    if updated:
-                        # Re-fetch transcript to get updated names
-                        time.sleep(2) # Small delay to let Scriberr update
-                        response, transcript_data = request_json("GET", url, headers=headers)
-                        if response and response.status_code == 200 and transcript_data:
-                            # CRITICAL: Re-clean the data so it's merged and formatted, not raw JSON
-                            logger.info(f"Re-cleaning transcript segments after speaker update for job {job_id}")
-                            transcript_data = self._clean_transcript_data(transcript_data)
-                    else:
-                        logger.warning(f"Speaker update was not applied for job {job_id}")
-                else:
-                    logger.warning(f"No speakers identified for job {job_id}")
-                    # Get response from OpenRouter for the message
-                    file_name = os.path.basename(original_file_path) if not is_manual_refresh else transcript_data.get('title', 'meeting')
-                    prompt = f"The transcription job for the file '{file_name}' (ID: {job_id}) completed, but no speakers could be identified from the transcript. Please provide a short, helpful message for the user about this situation."
-                    ai_response = self._get_openrouter_response(prompt)
-                    scriberr_link = f"{self.base_url}/transcription/{job_id}"
-                    self._send_telegram_notification(
-                        f"⚠️ No speakers identified for: {file_name}\n\nAI Response: {ai_response}\nView on Scriberr: {scriberr_link}"
-                    )
+                if not finalize:
+                    # Check if manual renaming has already occurred
+                    has_manual_renames = False
+                    if hasattr(self, 'main_app'):
+                        # Check if any callback for this job_id was an assignment
+                        for cb in self.main_app.callback_map.values():
+                            if cb.get("job_id") == job_id and cb.get("action") in ["confirm_rename", "confirm_swap"]:
+                                has_manual_renames = True
+                                break
+                    
+                    if not has_manual_renames:
+                        # Identify speakers using OpenRouter
+                        logger.info(f"Starting speaker identification for job {job_id}")
+                        identified_speakers = self._identify_speakers(transcript_data, job_id)
+                        if identified_speakers:
+                            logger.info(f"Speakers identified: {identified_speakers}")
+                            updated = self._update_scriberr_speakers(job_id, identified_speakers)
+                            if updated:
+                                # Re-fetch transcript to get updated names
+                                time.sleep(2) # Small delay to let Scriberr update
+                                response, transcript_data = request_json("GET", url, headers=headers)
+                                if response and response.status_code == 200 and transcript_data:
+                                    # CRITICAL: Re-clean the data so it's merged and formatted, not raw JSON
+                                    logger.info(f"Re-cleaning transcript segments after speaker update for job {job_id}")
+                                    transcript_data = self._clean_transcript_data(transcript_data)
+                            else:
+                                logger.warning(f"Speaker update was not applied for job {job_id}")
+                        else:
+                            logger.warning(f"No speakers identified for job {job_id}")
+                            # Get response from OpenRouter for the message
+                            file_name = os.path.basename(original_file_path) if not is_manual_refresh else transcript_data.get('title', 'meeting')
+                            prompt = f"The transcription job for the file '{file_name}' (ID: {job_id}) completed, but no speakers could be identified from the transcript. Please provide a short, helpful message for the user about this situation."
+                            ai_response = self._get_openrouter_response(prompt)
+                            scriberr_link = f"{self.base_url}/audio/{job_id}"
+                            self._send_telegram_notification(
+                                f"⚠️ No speakers identified for: {file_name}\n\nAI Response: {ai_response}\nView on Scriberr: {scriberr_link}"
+                            )
 
-                # Always offer manual speaker assignment based on transcript data
-                speakers = self._extract_speakers(transcript_data)
-                if speakers:
-                    self._offer_manual_speaker_assignment(job_id, speakers, transcript_data, identified_names=identified_speakers)
+                    # Always offer manual speaker assignment based on transcript data
+                    speakers = self._extract_speakers(transcript_data)
+                    if speakers:
+                        # Re-fetch identified_speakers if we skipped identification but have manual renames
+                        # This is a bit complex, but _offer_manual_speaker_assignment handles identified_names=None fine
+                        self._offer_manual_speaker_assignment(job_id, speakers, transcript_data, identified_names=(identified_speakers if not has_manual_renames else None))
 
                 # If manual refresh, we don't need to offer assignment again unless we want to allow multiple rounds
                 # But we DO need to save the file and trigger on_transcript_ready
@@ -571,7 +584,8 @@ Format:
         
         keyboard = []
         row = []
-        for speaker in sorted(list(speakers)):
+        sorted_speakers = sorted(list(speakers))
+        for speaker in sorted_speakers:
             display_name = display_map.get(speaker, speaker)
             cb_id = f"spk_{int(time.time())}_{speaker}"
             if hasattr(self, 'main_app'):
@@ -582,12 +596,27 @@ Format:
                     "file_name": file_name,
                     "current_name": display_name
                 }
-            row.append({"text": f"👤 {display_name}", "callback_data": cb_id})
+            # Requirement 5: Clearer Labels (Label + Current Name)
+            button_text = f"👤 {speaker}: {display_name}" if speaker != display_name else f"👤 {speaker}"
+            row.append({"text": button_text, "callback_data": cb_id})
             if len(row) == 2:
                 keyboard.append(row)
                 row = []
         if row:
             keyboard.append(row)
+
+        # Requirement 5: Handling Identity Swaps
+        if len(sorted_speakers) >= 2:
+            swap_cb_id = f"swap_{int(time.time())}"
+            if hasattr(self, 'main_app'):
+                self.main_app.callback_map[swap_cb_id] = {
+                    "action": "offer_swap",
+                    "job_id": job_id,
+                    "speakers": sorted_speakers,
+                    "display_map": display_map,
+                    "file_name": file_name
+                }
+            keyboard.append([{"text": "🔄 Swap Two Speakers", "callback_data": swap_cb_id}])
 
         # Add a "Done" button
         done_cb_id = f"spk_done_{int(time.time())}"
@@ -633,42 +662,26 @@ Format:
         }
         
         mappings = []
+        # Standardize input to a list of mappings
         if isinstance(speaker_map, dict):
-            items = speaker_map.items()
+            for original, custom in speaker_map.items():
+                mappings.append({
+                    "original_speaker": str(original).strip(),
+                    "custom_name": str(custom).strip()
+                })
         elif isinstance(speaker_map, list):
-            items = speaker_map
+            for entry in speaker_map:
+                if isinstance(entry, dict):
+                    original = entry.get("original_speaker")
+                    custom = entry.get("custom_name")
+                    if original is not None and custom is not None:
+                        mappings.append({
+                            "original_speaker": str(original).strip(),
+                            "custom_name": str(custom).strip()
+                        })
         else:
             logger.warning(f"Unsupported speaker map type: {type(speaker_map)}")
             return False
-
-        if isinstance(items, list):
-            for entry in items:
-                if not isinstance(entry, dict):
-                    continue
-                original = entry.get("original_speaker")
-                custom = entry.get("custom_name")
-                if original is None or custom is None:
-                    continue
-                original_str = str(original).strip()
-                custom_str = str(custom).strip()
-                if not original_str or not custom_str:
-                    continue
-                mappings.append({
-                    "original_speaker": original_str,
-                    "custom_name": custom_str
-                })
-        else:
-            for original, custom in items:
-                if original is None or custom is None:
-                    continue
-                original_str = str(original).strip()
-                custom_str = str(custom).strip()
-                if not original_str or not custom_str:
-                    continue
-                mappings.append({
-                    "original_speaker": original_str,
-                    "custom_name": custom_str
-                })
 
         if not mappings:
             logger.warning("No valid speaker mappings to update")
@@ -676,22 +689,10 @@ Format:
 
         try:
             logger.debug(f"Updating speakers for job {job_id} with payload: {mappings}")
+            # Standardize to wrapped payload as per Scriberr API expectations
             response, payload = request_json("POST", url, headers=headers, json_body={"mappings": mappings})
             if response and response.status_code == 200:
                 logger.info(f"Successfully updated speaker names for job {job_id}")
-                if payload is not None:
-                    logger.debug(f"Speaker update response: {payload}")
-                return True
-
-            # Fallback: some servers expect the list directly
-            logger.warning(
-                f"Speaker update failed with wrapped payload ({response.status_code if response else 'no response'}). Retrying with list payload."
-            )
-            response, payload = request_json("POST", url, headers=headers, json_body=mappings)
-            if response and response.status_code == 200:
-                logger.info(f"Successfully updated speaker names for job {job_id} (list payload)")
-                if payload is not None:
-                    logger.debug(f"Speaker update response: {payload}")
                 return True
             else:
                 response_text = response.text if response is not None else ""
