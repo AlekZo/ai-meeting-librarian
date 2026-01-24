@@ -240,11 +240,9 @@ class VideoUploader:
                     # Check if manual renaming has already occurred
                     has_manual_renames = False
                     if hasattr(self, 'main_app'):
-                        # Check if any callback for this job_id was an assignment
-                        for cb in self.main_app.callback_map.values():
-                            if cb.get("job_id") == job_id and cb.get("action") in ["confirm_rename", "confirm_swap"]:
-                                has_manual_renames = True
-                                break
+                        # Check if we already have manual renames for this job
+                        if job_id in self.main_app.active_mappings:
+                            has_manual_renames = True
                     
                     if not has_manual_renames:
                         # Identify speakers using OpenRouter
@@ -274,7 +272,7 @@ class VideoUploader:
                                 f"⚠️ No speakers identified for: {file_name}\n\nAI Response: {ai_response}\nView on Scriberr: {scriberr_link}"
                             )
 
-                    # Always offer manual speaker assignment based on transcript data
+                    # Always offer manual speaker assignment based on transcript data UNLESS we are in the finalize step
                     speakers = self._extract_speakers(transcript_data)
                     if speakers:
                         # Re-fetch identified_speakers if we skipped identification but have manual renames
@@ -544,9 +542,7 @@ Format:
                 match = re.search(r'\{.*\}', content, re.DOTALL)
                 if match:
                     names = json.loads(match.group())
-                    
-                    # Offer manual assignment with the identified names
-                    self._offer_manual_speaker_assignment(job_id, speakers, transcript_data, identified_names=names)
+                    # Just return names; the calling function (_download_transcript) will handle the UI display
                     return names
                 else:
                     logger.warning(f"Could not find JSON in OpenRouter response: {content}")

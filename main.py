@@ -574,7 +574,9 @@ class AutoMeetingVideoRenamer:
                     "s1": s1,
                     "s2": s2,
                     "name1": name1,
-                    "name2": name2
+                    "name2": name2,
+                    "all_speakers": speakers,  # Pass the full list to restore menu later
+                    "file_name": file_name     # Pass filename to restore menu later
                 }
                 keyboard.append([{"text": f"🔄 {name1} ↔️ {name2}", "callback_data": cb_id}])
             
@@ -610,6 +612,15 @@ class AutoMeetingVideoRenamer:
             
             if not success:
                 self.uploader._send_telegram_notification(f"❌ Failed to swap speakers for job {job_id}")
+            else:
+                # REFRESH MENU: Show the list again so user can continue editing or finalize
+                all_speakers = cb_data.get("all_speakers", [])
+                file_name = cb_data.get("file_name", "Meeting")
+                # Create a dummy transcript data object just to pass the title
+                dummy_transcript = {"title": file_name}
+                
+                # Re-trigger the menu
+                self.uploader._offer_manual_speaker_assignment(job_id, all_speakers, dummy_transcript)
 
         elif cb_data["action"] == "speaker_assignment_done":
             job_id = cb_data["job_id"]
@@ -627,25 +638,12 @@ class AutoMeetingVideoRenamer:
                 }
             )
             
-            # Requirement 3: Visual Mapping Table
-            # We need to fetch the current speakers from Scriberr to show the final mapping
-            try:
-                url = f"{self.uploader.base_url}/api/v1/transcription/{job_id}/speakers"
-                headers = {"X-API-Key": self.uploader.api_key}
-                response, speakers_data = request_json("GET", url, headers=headers)
-                
-                if response and response.status_code == 200 and speakers_data:
-                    # speakers_data is likely a list of {original_speaker, custom_name}
-                    table_lines = [f"📊 **Final Speaker Mapping for {file_name}:**"]
-                    # Handle both wrapped and unwrapped response
-                    mappings = speakers_data.get("mappings", speakers_data) if isinstance(speakers_data, dict) else speakers_data
-                    for entry in mappings:
-                        orig = entry.get("original_speaker", "Unknown")
-                        custom = entry.get("custom_name", orig)
-                        table_lines.append(f"• {orig} ➔ **{custom}**")
-                    self.uploader._send_telegram_notification("\n".join(table_lines))
-            except Exception as e:
-                logger.error(f"Failed to fetch final speaker mapping: {e}")
+            # Use local session data to show the final summary
+            if job_id in self.active_mappings:
+                table_lines = [f"📊 **Final Speaker Mapping for {file_name}:**"]
+                for orig, custom in self.active_mappings[job_id].items():
+                    table_lines.append(f"• {orig} ➔ **{custom}**")
+                self.uploader._send_telegram_notification("\n".join(table_lines))
 
             self.uploader._send_telegram_notification(f"✅ Finalizing transcript for {file_name}...")
             
@@ -846,9 +844,13 @@ class AutoMeetingVideoRenamer:
                 
                 logger.info(f"Manual speaker rename request: Job {job_id}, {speaker_id} -> {new_name}")
                 
-                # Update Scriberr
-                mapping = {"original_speaker": speaker_id, "custom_name": new_name}
-                success = self.uploader._update_scriberr_speakers(job_id, [mapping])
+                # Update session storage
+                if job_id not in self.active_mappings:
+                    self.active_mappings[job_id] = {}
+                self.active_mappings[job_id][speaker_id] = new_name
+                
+                # Send the COMPLETE list of mappings
+                success = self.uploader._update_scriberr_speakers(job_id, self.active_mappings[job_id])
                 
                 if success:
                     self.uploader._send_telegram_notification(f"✅ Updated {speaker_id} to **{new_name}** for job {job_id}")
@@ -962,9 +964,13 @@ class AutoMeetingVideoRenamer:
             logger.error("google_sheets_id is not configured")
             return
 
+        # Обновленный порядок колонок:
+        # Date | Name | Speakers | Summary | Project | Video Link | Scriberr Link | Doc Link | Status
         row = [
             item.get("meeting_time", ""),
             item.get("meeting_name", ""),
+            item.get("speakers", ""),       # Добавлено
+            item.get("summary", ""),        # Добавлено
             item.get("project_tag", ""),
             item.get("video_source_link", ""),
             item.get("scribber_link", ""),
@@ -985,18 +991,32 @@ class AutoMeetingVideoRenamer:
                 logger.warning("Sheet ID or transcript path missing; skipping meeting log publish")
                 return
 
-            # Upload transcript to Drive
+            # 1. Загрузка транскрипта (теперь создает Google Doc)
             transcript_drive_link = self.sheets_handler.upload_transcript(transcript_path, drive_folder_id)
 
-            # Build full transcript text for tagging
+            # Подготовка текста для AI
             full_transcript_text = self._build_full_transcript_text(transcript_data)
-            full_transcript_text = self._trim_transcript_for_openrouter(full_transcript_text)
+            trimmed_text = self._trim_transcript_for_openrouter(full_transcript_text)
 
-            # Load project config
+            # 2. Извлечение Спикеров
+            speakers = self.uploader._extract_speakers(transcript_data)
+            speakers_str = ", ".join(sorted(list(speakers))) if speakers else ""
+
+            # 3. Генерация Summary (кратко)
+            summary = ""
+            if trimmed_text:
+                summary_prompt = (
+                    "Summarize the following meeting transcript in 3-5 concise sentences. "
+                    "Focus on key decisions, action items, and the main topic.\n\n"
+                    f"Transcript:\n{trimmed_text}"
+                )
+                summary = self.uploader._get_openrouter_response(summary_prompt)
+
+            # Определение проекта (существующая логика)
             projects = self.sheets_handler.read_project_config(sheet_id, project_tab)
-            project_tag = self._identify_project_tag(projects, full_transcript_text)
+            project_tag = self._identify_project_tag(projects, trimmed_text)
 
-            # Compose row
+            # Подготовка данных для таблицы
             meeting_time = (meeting_info or {}).get("meeting_time", "")
             meeting_name = (meeting_info or {}).get("meeting_name", "")
             video_source_link = (meeting_info or {}).get("video_source_link", "")
@@ -1007,6 +1027,8 @@ class AutoMeetingVideoRenamer:
             item = {
                 "meeting_time": meeting_time,
                 "meeting_name": meeting_name,
+                "speakers": speakers_str,    # НОВОЕ ПОЛЕ
+                "summary": summary,          # НОВОЕ ПОЛЕ
                 "project_tag": project_tag,
                 "video_source_link": video_source_link,
                 "scribber_link": scribber_link,
@@ -1025,6 +1047,8 @@ class AutoMeetingVideoRenamer:
                 item = {
                     "meeting_time": meeting_info.get("meeting_time", ""),
                     "meeting_name": meeting_info.get("meeting_name", ""),
+                    "speakers": "",
+                    "summary": "",
                     "project_tag": "",
                     "video_source_link": meeting_info.get("video_source_link", ""),
                     "scribber_link": f"{self.uploader.base_url}/audio/{job_id}",

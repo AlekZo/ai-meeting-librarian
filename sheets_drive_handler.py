@@ -138,17 +138,19 @@ class SheetsDriveHandler:
         meeting_headers = [[
             "Date & Time",
             "Meeting Name",
+            "Speakers",             # Добавлено
+            "Summary",              # Добавлено
             "Project Tag",
             "Video Source Link",
             "Scribber Link",
-            "Transcript Drive Link",
+            "Transcript Drive Doc", # Изменено название
             "Status",
         ]]
         project_headers = [["Project Name", "Keywords / Context"]]
 
         self.sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f"{meeting_tab}!A1:G1",
+            range=f"{meeting_tab}!A1:I1",
             valueInputOption="RAW",
             body={"values": meeting_headers},
         ).execute()
@@ -162,24 +164,40 @@ class SheetsDriveHandler:
 
     def upload_transcript(self, file_path: str, folder_id: str | None) -> str:
         self._ensure_services()
-        file_metadata = {"name": os.path.basename(file_path)}
+        
+        # Убираем расширение .txt из имени файла для Google Doc
+        file_name = os.path.basename(file_path)
+        if file_name.lower().endswith('.txt'):
+            file_name = file_name[:-4]
+
+        # Указываем MIME-тип Google Doc для конвертации
+        file_metadata = {
+            "name": file_name,
+            "mimeType": "application/vnd.google-apps.document"
+        }
+        
         if folder_id:
             file_metadata["parents"] = [folder_id]
 
         media = MediaFileUpload(file_path, mimetype="text/plain", resumable=False)
+        
+        # Запрашиваем webViewLink сразу в ответе
         file = (
             self.drive_service.files()
-            .create(body=file_metadata, media_body=media, fields="id")
+            .create(body=file_metadata, media_body=media, fields="id, webViewLink")
             .execute()
         )
         file_id = file.get("id")
+        web_view_link = file.get("webViewLink")
+
         if not file_id:
             raise RuntimeError("Drive upload failed: no file id returned")
 
-        # Make the file shareable
+        # Делаем файл доступным по ссылке (reader)
         self.drive_service.permissions().create(
             fileId=file_id,
             body={"role": "reader", "type": "anyone"},
         ).execute()
 
-        return f"https://drive.google.com/file/d/{file_id}/view"
+        # Возвращаем ссылку на Google Doc
+        return web_view_link or f"https://docs.google.com/document/d/{file_id}/edit"
