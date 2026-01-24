@@ -87,6 +87,9 @@ sync-meeting-name-with-google/
 ├── google_calendar_handler.py        # Google API integration
 ├── file_monitor.py                  # Folder monitoring
 ├── file_renamer.py                  # Renaming logic
+├── video_uploader.py                # Transcription & Telegram integration
+├── callback_persistence.py          # Persistent Telegram interactions
+├── meeting_log_queue.py             # Offline log queuing
 ├── logger.py                        # Logging setup
 ├── test_modules.py                  # Module tests
 ├── requirements.txt                 # Python dependencies

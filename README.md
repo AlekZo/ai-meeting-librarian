@@ -26,6 +26,8 @@ The **Auto-Meeting Video Renamer** is a Windows background utility that automati
 - **Comprehensive Logging**: Tracks all operations with detailed timestamps
 - **Error Handling**: Gracefully handles API issues and missing meetings
 - **Offline Mode**: Automatically queues files when internet is unavailable and processes them when connection is restored
+- **Persistent Interactions**: Telegram callback buttons survive app restarts via JSON storage
+- **OS-Level File Safety**: Uses Windows-specific file handle checks to ensure recordings are finished before processing
 - **Configuration File**: Easy-to-customize JSON config
 - **Virtual Environment**: Isolated Python environment with all dependencies
 

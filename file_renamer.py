@@ -139,18 +139,33 @@ class FileRenamer:
             bool: True if file is ready, False otherwise
         """
         import time
+        import os
         
         for attempt in range(check_attempts):
             try:
-                # Try to open the file exclusively
+                # Try to open the file exclusively for writing
+                # On Windows, this will fail if another process has it open
+                # On Unix, this might not be enough depending on how the other process opened it
+                if os.name == 'nt':
+                    # Windows specific check
+                    try:
+                        # Try to rename the file to itself - this is a strong indicator of a lock on Windows
+                        os.rename(file_path, file_path)
+                    except (IOError, OSError):
+                        logger.debug(f"File is locked by another process (Windows rename check)")
+                        raise IOError("File is locked")
+                
+                # Standard check: Try to open for appending
+                with open(file_path, 'ab') as f:
+                    pass
+                
+                # Size stability check
                 with open(file_path, 'rb') as f:
-                    f.seek(0, 2)  # Seek to end
+                    f.seek(0, 2)
                     file_size = f.tell()
                 
-                # Small delay between checks
                 if attempt < check_attempts - 1:
                     time.sleep(check_delay)
-                    # Verify size hasn't changed
                     with open(file_path, 'rb') as f:
                         f.seek(0, 2)
                         new_size = f.tell()

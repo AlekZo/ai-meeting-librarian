@@ -32,7 +32,13 @@ What happens:
 
 ### Step 2: Monitor the App (While Running in Background)
 
-**Option A: View Logs in PowerShell (Recommended)**
+**Option A: System Tray Icon (New!)**
+- Look for the **Auto-Meeting Video Renamer** icon in your Windows Taskbar (near the clock).
+- **Green Circle**: Online and monitoring.
+- **Orange Circle**: Offline (queuing files).
+- **Right-Click**: View status or **Quit** the application.
+
+**Option B: View Logs in PowerShell**
 ```powershell
 cd d:\Nextcloud\Apps\sync-meeting-name-with-google
 Get-Content logs\auto_renamer.log -Wait

@@ -94,6 +94,7 @@ class VideoUploader:
                     # Register the job for potential cancellation
                     if hasattr(self, 'main_app'):
                         self.main_app.callback_map[cb_id] = {"action": "cancel", "job_id": job_id, "file_path": file_path}
+                        self.main_app.callback_persistence.save(self.main_app.callback_map)
                     self.start_transcription(job_id, file_path)
             else:
                 logger.error(f"Failed to upload {file_name}. Status: {response.status_code}")
@@ -167,6 +168,7 @@ class VideoUploader:
                 cb_id = f"cancel_{int(time.time())}"
                 if hasattr(self, 'main_app'):
                     self.main_app.callback_map[cb_id] = {"action": "cancel", "job_id": job_id, "file_path": original_file_path}
+                    self.main_app.callback_persistence.save(self.main_app.callback_map)
                 
                 self._send_telegram_notification(
                     f"🎙️ Transcription started: {os.path.basename(original_file_path)}",
@@ -463,7 +465,22 @@ class VideoUploader:
         except Exception as e:
             logger.error(f"Failed to send transcript to Telegram: {e}")
 
-        # OpenRouter Prompt (Including full transcript for identification)
+        # Token Efficiency: Use only first and last 5 minutes for speaker identification
+        # Assuming roughly 150 words per minute, 5 mins is ~750 words. 
+        # We'll take the first 20 and last 20 segments as a heuristic for "start and end".
+        if len(formatted_lines) > 40:
+            logger.info(f"Transcript is long ({len(formatted_lines)} segments). Truncating for OpenRouter efficiency.")
+            efficient_transcript = (
+                "--- START OF TRANSCRIPT ---\n" +
+                "\n\n".join(formatted_lines[:20]) +
+                "\n\n... [Transcript truncated for token efficiency] ...\n\n" +
+                "\n\n".join(formatted_lines[-20:]) +
+                "\n--- END OF TRANSCRIPT ---"
+            )
+        else:
+            efficient_transcript = full_transcript_text
+
+        # OpenRouter Prompt (Including efficient transcript for identification)
         prompt = f"""
 You are an expert linguistic analyst specialized in transcript diarization. 
 Your task is to identify the real names of the speakers in the provided conversation text.
@@ -471,8 +488,8 @@ Your task is to identify the real names of the speakers in the provided conversa
 **Input Data:**
 Current Speaker Labels: {', '.join(speakers)}
 
-**Conversation (Full Transcript):**
-{full_transcript_text}
+**Conversation (Start and End of Transcript):**
+{efficient_transcript}
 
 **Analysis Instructions:**
 1. **Self-Identification:** Prioritize explicit introductions (e.g., "Hi, this is Alex").
@@ -581,6 +598,7 @@ Format:
                 "file_name": file_name,
                 "transcript_data": transcript_data # Store for re-processing
             }
+            self.main_app.callback_persistence.save(self.main_app.callback_map)
         keyboard.append([{"text": "✅ Finalize Transcript", "callback_data": done_cb_id}])
 
         self._send_telegram_notification(message, reply_markup={"inline_keyboard": keyboard})

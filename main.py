@@ -35,6 +35,8 @@ from video_uploader import VideoUploader
 from http_client import request_json, request_text
 from sheets_drive_handler import SheetsDriveHandler
 from meeting_log_queue import MeetingLogQueue
+from callback_persistence import CallbackPersistence
+from system_tray import SystemTrayIcon
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +53,18 @@ class AutoMeetingVideoRenamer:
         self.uploader.main_app = self # Allow uploader to access callback_map
         self.running = False
         
+        self.tray = SystemTrayIcon(on_quit_callback=self.shutdown)
+        self.tray.start()
+        self.tray.update_status("Initializing...", "yellow")
+        
         # Send startup notification
         self.uploader._send_telegram_notification("🚀 Auto-Meeting Video Renamer started and monitoring folders...")
         
         self.pending_files = []  # Queue for files detected while offline
         self.internet_available = False
-        self.callback_map = {} # Map short IDs to full data for Telegram buttons
+        
+        self.callback_persistence = CallbackPersistence()
+        self.callback_map = self.callback_persistence.load() # Map short IDs to full data for Telegram buttons
         self.user_states = {} # Track user states for ForceReply (e.g., renaming speaker)
 
         self.sheets_handler = SheetsDriveHandler(
@@ -96,6 +104,7 @@ class AutoMeetingVideoRenamer:
             if self.check_internet_connection():
                 logger.info("✓ Internet connection restored!")
                 self.internet_available = True
+                self.tray.update_status("Monitoring (Online)", "green")
                 return True
             
             logger.debug(f"Still waiting for internet... (checking again in {check_interval}s)")
@@ -240,6 +249,7 @@ class AutoMeetingVideoRenamer:
         self.callback_map[cb_id] = {"action": "retry", "file_path": file_path}
         cancel_id = f"skip_{int(time.time())}"
         self.callback_map[cancel_id] = {"action": "skip", "file_path": file_path}
+        self.callback_persistence.save(self.callback_map)
 
         self.uploader._send_telegram_notification(
             f"❓ No meeting found for: {filename}\n\nPlease add it to Google Calendar and click Retry.",
@@ -262,6 +272,7 @@ class AutoMeetingVideoRenamer:
 
         cancel_id = f"skip_{int(time.time())}"
         self.callback_map[cancel_id] = {"action": "skip", "file_path": file_path}
+        self.callback_persistence.save(self.callback_map)
         buttons.append([{"text": "❌ Cancel", "callback_data": cancel_id}])
 
         self.uploader._send_telegram_notification(
@@ -418,6 +429,11 @@ class AutoMeetingVideoRenamer:
         # Look up full data from short ID
         cb_data = self.callback_map.get(data)
         if not cb_data:
+            # Try reloading from disk in case it was updated by another process or just restarted
+            self.callback_map = self.callback_persistence.load()
+            cb_data = self.callback_map.get(data)
+            
+        if not cb_data:
             logger.warning(f"Unknown or expired callback ID: {data}. Current map keys: {list(self.callback_map.keys())}")
             self.uploader._send_telegram_notification("⚠️ This button has expired or the app was restarted. Please try again with a new file.")
             return
@@ -554,6 +570,7 @@ class AutoMeetingVideoRenamer:
                     # Internet just came back online
                     logger.info("✓ Internet connection detected!")
                     self.internet_available = True
+                    self.tray.update_status("Monitoring (Online)", "green")
                     
                     # Process any pending files
                     if self.pending_files:
@@ -566,6 +583,7 @@ class AutoMeetingVideoRenamer:
                     # Internet just went offline
                     logger.warning("✗ Internet connection lost!")
                     self.internet_available = False
+                    self.tray.update_status("Offline (Queuing)", "orange")
                 
                 time.sleep(check_interval)
             
