@@ -1028,13 +1028,38 @@ class AutoMeetingVideoRenamer:
 
             # 2. Извлечение Спикеров
             speakers = self.uploader._extract_speakers(transcript_data)
-            speakers_str = ", ".join(sorted(list(speakers))) if speakers else ""
+            
+            # Apply manual renames from Telegram
+            mapping = self.active_mappings.get(job_id, {})
+            final_speakers = []
+            for s in speakers:
+                if s in mapping:
+                    final_speakers.append(mapping[s])
+                else:
+                    final_speakers.append(s)
+            
+            speakers_str = ", ".join(sorted(list(set(final_speakers)))) if final_speakers else ""
 
             # 3. Определение Типа Встречи (ДИНАМИЧЕСКИ ИЗ ТАБЛИЦЫ)
             type_tab = self.config.get("google_sheets_type_tab", "Meeting_Types")
             meeting_types_config = self.sheets_handler.read_meeting_types_config(sheet_id, type_tab)
             
             meeting_name = (meeting_info or {}).get("meeting_name", "")
+            meeting_time = (meeting_info or {}).get("meeting_time", "")
+
+            # Fallback logic: if meeting_info is missing, extract from filename
+            if not meeting_name or not meeting_time:
+                filename = os.path.basename(original_file_path)
+                dt_obj, timestamp_str = FileRenamer.extract_timestamp_from_filename(filename)
+                
+                if not meeting_name and timestamp_str:
+                    # Extract meeting name from part before timestamp (Title_YYYY-MM-DD_HH-MM-SS.mp4)
+                    meeting_name = filename.split(f"_{timestamp_str}")[0].replace("_", " ")
+                
+                if not meeting_time and dt_obj:
+                    # Use extracted datetime object as meeting_time (ISO format for later parsing)
+                    meeting_time = dt_obj.isoformat()
+
             meeting_type = "General"
             if trimmed_text:
                 if meeting_types_config:
@@ -1063,8 +1088,10 @@ class AutoMeetingVideoRenamer:
             summary = ""
             if trimmed_text:
                 summary_prompt = (
-                    "Summarize the following meeting transcript in 3-5 concise sentences. "
-                    "Focus on key decisions, action items, and the main topic.\n\n"
+                    "Analyze the following meeting transcript. "
+                    "1. Detect the language used (e.g., English, Russian). "
+                    "2. Write a VERY concise summary (1-2 sentences MAX) in that SAME language. "
+                    "Focus only on the core topic and key outcome.\n\n"
                     f"Transcript:\n{trimmed_text}"
                 )
                 summary = self.uploader._get_openrouter_response(summary_prompt)
