@@ -25,6 +25,7 @@ The **Auto-Meeting Video Renamer** is a Windows background utility that automati
 - **File Safety**: Checks that files are fully written before processing
 - **Comprehensive Logging**: Tracks all operations with detailed timestamps
 - **Error Handling**: Gracefully handles API issues and missing meetings
+- **Offline Mode**: Automatically queues files when internet is unavailable and processes them when connection is restored
 - **Configuration File**: Easy-to-customize JSON config
 - **Virtual Environment**: Isolated Python environment with all dependencies
 
@@ -344,6 +345,18 @@ Video File Created
         ↓
 Monitor Detects File
         ↓
+Internet Available?
+    ↙       ↘
+  YES       NO
+   ↓         ↓
+   ↓      Queue File
+   ↓         ↓
+   ↓      Wait for Internet
+   ↓         ↓
+   ↓      Internet Restored
+   ↓         ↓
+   ↓      Process Queue
+    ↘       ↙
 Extract Timestamp from Filename (2026-01-22_14-26-31)
         ↓
 Check if File is Ready (fully written)
