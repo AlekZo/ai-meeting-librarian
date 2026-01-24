@@ -289,6 +289,9 @@ class VideoUploader:
                     transcript_data['title'] = existing_transcript_data.get('title', 'meeting')
                     # We use a dummy path or try to find the original one if we had it
                     save_path = f"refreshed_{job_id}.txt" 
+                    # Restore meeting_info from the job_id if it was lost during manual refresh
+                    if job_id not in self.meeting_info_by_job and 'meeting_info' in existing_transcript_data:
+                        self.meeting_info_by_job[job_id] = existing_transcript_data['meeting_info']
                 else:
                     save_path = original_file_path
 
@@ -642,7 +645,7 @@ Format:
                 "action": "speaker_assignment_done",
                 "job_id": job_id,
                 "file_name": file_name,
-                "transcript_data": transcript_data # Store for re-processing
+                "transcript_data": {**transcript_data, "meeting_info": self.meeting_info_by_job.get(job_id)} # Store for re-processing
             }
             self.main_app.callback_persistence.save(self.main_app.callback_map)
         keyboard.append([{"text": "✅ Finalize Transcript", "callback_data": done_cb_id}])

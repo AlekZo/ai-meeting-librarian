@@ -647,6 +647,18 @@ class AutoMeetingVideoRenamer:
                 }
             )
             
+            # Ensure ALL mappings (AI + Manual) are pushed to Scriberr one last time
+            final_mappings = {}
+            if job_id in self.initial_speaker_mappings:
+                final_mappings.update(self.initial_speaker_mappings[job_id])
+            if job_id in self.active_mappings:
+                final_mappings.update(self.active_mappings[job_id])
+            
+            if final_mappings:
+                logger.info(f"Applying final speaker mappings for job {job_id} before finalization")
+                self.uploader._update_scriberr_speakers(job_id, final_mappings)
+                time.sleep(1) # Give Scriberr a moment to process
+
             # Use local session data to show the final summary
             if job_id in self.active_mappings:
                 table_lines = [f"📊 **Final Speaker Mapping for {file_name}:**"]
