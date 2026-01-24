@@ -66,6 +66,7 @@ class AutoMeetingVideoRenamer:
         self.callback_persistence = CallbackPersistence()
         self.callback_map = self.callback_persistence.load() # Map short IDs to full data for Telegram buttons
         self.user_states = {} # Track user states for ForceReply (e.g., renaming speaker)
+        self.active_mappings = {} # Track all speaker renames per job_id: {job_id: {orig: custom}}
 
         self.sheets_handler = SheetsDriveHandler(
             self.config.get("google_credentials_path"),
@@ -532,20 +533,26 @@ class AutoMeetingVideoRenamer:
             speaker_id = cb_data["speaker_id"]
             new_name = cb_data["new_name"]
             
-            # Remove buttons
+            # Persist the mapping in the session
+            if job_id not in self.active_mappings:
+                self.active_mappings[job_id] = {}
+            self.active_mappings[job_id][speaker_id] = new_name
+
+            # UI Cleanup: Edit the confirmation message
             request_json(
                 "POST",
-                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
-                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json_body={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": f"✅ Confirmed: Updated **{speaker_id}** to **{new_name}**"
+                }
             )
             
-            # Update Scriberr
-            mapping = {"original_speaker": speaker_id, "custom_name": new_name}
-            success = self.uploader._update_scriberr_speakers(job_id, [mapping])
+            # Update Scriberr with ALL current mappings for this job
+            success = self.uploader._update_scriberr_speakers(job_id, self.active_mappings[job_id])
             
-            if success:
-                self.uploader._send_telegram_notification(f"✅ Updated **{speaker_id}** to **{new_name}**")
-            else:
+            if not success:
                 self.uploader._send_telegram_notification(f"❌ Failed to update speaker for job {job_id}")
 
         elif cb_data["action"] == "offer_swap":
@@ -581,23 +588,27 @@ class AutoMeetingVideoRenamer:
             s1, s2 = cb_data["s1"], cb_data["s2"]
             name1, name2 = cb_data["name1"], cb_data["name2"]
             
-            # Remove buttons
+            # Persist the swapped mappings
+            if job_id not in self.active_mappings:
+                self.active_mappings[job_id] = {}
+            self.active_mappings[job_id][s1] = name2
+            self.active_mappings[job_id][s2] = name1
+
+            # UI Cleanup: Edit the confirmation message
             request_json(
                 "POST",
-                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
-                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json_body={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": f"✅ Swapped names: **{s1}** is now **{name2}**, **{s2}** is now **{name1}**"
+                }
             )
             
-            # Swap: s1 gets name2, s2 gets name1
-            mappings = [
-                {"original_speaker": s1, "custom_name": name2},
-                {"original_speaker": s2, "custom_name": name1}
-            ]
-            success = self.uploader._update_scriberr_speakers(job_id, mappings)
+            # Update Scriberr with ALL current mappings for this job
+            success = self.uploader._update_scriberr_speakers(job_id, self.active_mappings[job_id])
             
-            if success:
-                self.uploader._send_telegram_notification(f"✅ Swapped names: **{s1}** is now **{name2}**, **{s2}** is now **{name1}**")
-            else:
+            if not success:
                 self.uploader._send_telegram_notification(f"❌ Failed to swap speakers for job {job_id}")
 
         elif cb_data["action"] == "speaker_assignment_done":

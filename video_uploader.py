@@ -575,12 +575,15 @@ Format:
 
         file_name = os.path.basename(transcript_data.get('title', 'Unknown'))
         
-        if identified_names:
+        # Merge identified_names with any active manual mappings from the session
+        display_map = identified_names or {s: s for s in speakers}
+        if hasattr(self, 'main_app') and job_id in self.main_app.active_mappings:
+            display_map.update(self.main_app.active_mappings[job_id])
+        
+        if identified_names or (hasattr(self, 'main_app') and job_id in self.main_app.active_mappings):
             message = f"✅ Speakers identified for: {file_name}\n\nTap a speaker below to correct their name:"
-            display_map = identified_names
         else:
             message = f"Manual Speaker Assignment for: {file_name}\n\nSelect a speaker to rename:"
-            display_map = {s: s for s in speakers}
         
         keyboard = []
         row = []
