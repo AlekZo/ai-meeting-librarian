@@ -67,6 +67,7 @@ class AutoMeetingVideoRenamer:
         self.callback_map = self.callback_persistence.load() # Map short IDs to full data for Telegram buttons
         self.user_states = {} # Track user states for ForceReply (e.g., renaming speaker)
         self.active_mappings = {} # Track all speaker renames per job_id: {job_id: {orig: custom}}
+        self.initial_speaker_mappings = {} # Track AI-detected names per job_id
 
         self.sheets_handler = SheetsDriveHandler(
             self.config.get("google_credentials_path"),
@@ -990,8 +991,12 @@ class AutoMeetingVideoRenamer:
         ]
         self.sheets_handler.append_meeting_log(sheet_id, meeting_tab, row)
 
-    def on_transcript_ready(self, job_id, original_file_path, transcript_data, transcript_path, meeting_info=None):
+    def on_transcript_ready(self, job_id, original_file_path, transcript_data, transcript_path, meeting_info=None, is_final=False):
         """Called by uploader when transcript is ready."""
+        if not is_final:
+            logger.info(f"Transcript for job {job_id} is not final yet. Skipping Sheets logging.")
+            return
+
         try:
             sheet_id = self.config.get("google_sheets_id")
             meeting_tab = self.config.get("google_sheets_meeting_tab", "Meeting_Logs")
@@ -1058,6 +1063,28 @@ class AutoMeetingVideoRenamer:
 
             # Подготовка данных для таблицы
             meeting_time = (meeting_info or {}).get("meeting_time", "")
+            
+            # Format meeting_time to M/D/YYYY HH:MM:SS with +3 TZ offset
+            if meeting_time:
+                try:
+                    # Google Calendar returns ISO format: 2026-01-22T20:00:00+03:00 or 2026-01-22T20:00:00Z
+                    # We want to ensure it's in +3 and format it as M/D/YYYY HH:MM:SS
+                    from dateutil import parser
+                    dt = parser.parse(meeting_time)
+                    
+                    # If it has timezone info, convert to +3. If not, assume it's already local or UTC.
+                    # The user specifically asked for +3.
+                    from datetime import timezone, timedelta
+                    target_tz = timezone(timedelta(hours=3))
+                    dt_target = dt.astimezone(target_tz)
+                    
+                    # Format: M/D/YYYY HH:MM:SS (e.g., 1/22/2026 20:00:00)
+                    # %m/%d/%Y includes leading zeros (01/22/2026). 
+                    # To remove leading zeros on Windows, use %#m/%#d/%Y.
+                    meeting_time = dt_target.strftime("%#m/%#d/%Y %H:%M:%S")
+                except Exception as e:
+                    logger.error(f"Error formatting meeting_time '{meeting_time}': {e}")
+
             # meeting_name already extracted above
             video_source_link = (meeting_info or {}).get("video_source_link", "")
             if video_source_link:

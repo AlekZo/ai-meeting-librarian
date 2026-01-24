@@ -250,6 +250,8 @@ class VideoUploader:
                         identified_speakers = self._identify_speakers(transcript_data, job_id)
                         if identified_speakers:
                             logger.info(f"Speakers identified: {identified_speakers}")
+                            if hasattr(self, 'main_app'):
+                                self.main_app.initial_speaker_mappings[job_id] = identified_speakers
                             updated = self._update_scriberr_speakers(job_id, identified_speakers)
                             if updated:
                                 # Re-fetch transcript to get updated names
@@ -297,12 +299,19 @@ class VideoUploader:
                 
                 if hasattr(self, 'main_app'):
                     meeting_info = self.meeting_info_by_job.pop(job_id, None)
+                    # If finalize=False but we are skipping interaction (e.g. no Telegram token), we must treat it as final.
+                    # However, here we check if we should finalize based on the 'finalize' argument or if it's a manual refresh.
+                    is_final_call = finalize
+                    if not finalize and not self.config.get("telegram_bot_token"):
+                        is_final_call = True
+                        
                     self.main_app.on_transcript_ready(
                         job_id,
                         original_file_path,
                         transcript_data,
                         transcript_path,
                         meeting_info,
+                        is_final=is_final_call
                     )
                 
                 if is_manual_refresh:
@@ -572,11 +581,19 @@ Format:
         file_name = os.path.basename(transcript_data.get('title', 'Unknown'))
         
         # Merge identified_names with any active manual mappings from the session
-        display_map = identified_names or {s: s for s in speakers}
-        if hasattr(self, 'main_app') and job_id in self.main_app.active_mappings:
-            display_map.update(self.main_app.active_mappings[job_id])
+        # Priority: Default (SPEAKER_XX) < AI Initial Guesses < Manual Overrides
+        display_map = {s: s for s in speakers}
+        if hasattr(self, 'main_app'):
+            # Apply AI Initial Guesses
+            if job_id in self.main_app.initial_speaker_mappings:
+                display_map.update(self.main_app.initial_speaker_mappings[job_id])
+            # Apply Manual Overrides (Highest Priority)
+            if job_id in self.main_app.active_mappings:
+                display_map.update(self.main_app.active_mappings[job_id])
+        elif identified_names:
+            display_map.update(identified_names)
         
-        if identified_names or (hasattr(self, 'main_app') and job_id in self.main_app.active_mappings):
+        if (hasattr(self, 'main_app') and (job_id in self.main_app.initial_speaker_mappings or job_id in self.main_app.active_mappings)) or identified_names:
             message = f"✅ Speakers identified for: {file_name}\n\nTap a speaker below to correct their name:"
         else:
             message = f"Manual Speaker Assignment for: {file_name}\n\nSelect a speaker to rename:"
