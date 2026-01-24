@@ -965,12 +965,13 @@ class AutoMeetingVideoRenamer:
             return
 
         # Обновленный порядок колонок:
-        # Date | Name | Speakers | Summary | Project | Video Link | Scriberr Link | Doc Link | Status
+        # Date | Name | Type | Speakers | Summary | Project | Video Link | Scriberr Link | Doc Link | Status
         row = [
             item.get("meeting_time", ""),
             item.get("meeting_name", ""),
-            item.get("speakers", ""),       # Добавлено
-            item.get("summary", ""),        # Добавлено
+            item.get("meeting_type", ""),
+            item.get("speakers", ""),
+            item.get("summary", ""),
             item.get("project_tag", ""),
             item.get("video_source_link", ""),
             item.get("scribber_link", ""),
@@ -1002,7 +1003,20 @@ class AutoMeetingVideoRenamer:
             speakers = self.uploader._extract_speakers(transcript_data)
             speakers_str = ", ".join(sorted(list(speakers))) if speakers else ""
 
-            # 3. Генерация Summary (кратко)
+            # 3. Определение Типа Встречи (Meeting Type)
+            meeting_type = "General"
+            if trimmed_text:
+                type_prompt = (
+                    "Classify this meeting into one of these categories: "
+                    "Daily Standup, Sprint Planning, Retrospective, Client Meeting, "
+                    "Technical Discussion, 1:1, Demo, Webinar, or Brainstorming. "
+                    "Return ONLY the category name.\n\n"
+                    f"Transcript Start:\n{trimmed_text[:2000]}"
+                )
+                meeting_type = self.uploader._get_openrouter_response(type_prompt)
+                meeting_type = str(meeting_type).strip(" .")
+
+            # 4. Генерация Summary (кратко)
             summary = ""
             if trimmed_text:
                 summary_prompt = (
@@ -1027,8 +1041,9 @@ class AutoMeetingVideoRenamer:
             item = {
                 "meeting_time": meeting_time,
                 "meeting_name": meeting_name,
-                "speakers": speakers_str,    # НОВОЕ ПОЛЕ
-                "summary": summary,          # НОВОЕ ПОЛЕ
+                "meeting_type": meeting_type,
+                "speakers": speakers_str,
+                "summary": summary,
                 "project_tag": project_tag,
                 "video_source_link": video_source_link,
                 "scribber_link": scribber_link,

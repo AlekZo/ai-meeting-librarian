@@ -138,19 +138,20 @@ class SheetsDriveHandler:
         meeting_headers = [[
             "Date & Time",
             "Meeting Name",
-            "Speakers",             # Добавлено
-            "Summary",              # Добавлено
+            "Meeting Type",
+            "Speakers",
+            "Summary",
             "Project Tag",
             "Video Source Link",
             "Scribber Link",
-            "Transcript Drive Doc", # Изменено название
+            "Transcript Drive Doc",
             "Status",
         ]]
         project_headers = [["Project Name", "Keywords / Context"]]
 
         self.sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f"{meeting_tab}!A1:I1",
+            range=f"{meeting_tab}!A1:J1",
             valueInputOption="RAW",
             body={"values": meeting_headers},
         ).execute()
