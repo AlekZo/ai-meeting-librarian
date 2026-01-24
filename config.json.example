@@ -1,0 +1,33 @@
+{
+    "api_base_url": "http://localhost:8080",
+    "api_key": "YOUR_API_KEY_HERE",
+    "drive_transcript_folder_id": "YOUR_FOLDER_ID_HERE",
+    "dry_run": false,
+    "enable_logging": true,
+    "enable_upload": true,
+    "file_lock_check_attempts": 5,
+    "file_lock_check_delay": 2,
+    "google_credentials_path": "credentials.json",
+    "google_sheets_id": "YOUR_SHEETS_ID_HERE",
+    "google_sheets_meeting_tab": "Meeting_Logs",
+    "google_sheets_project_tab": "Project_Config",
+    "google_token_path": "token.json",
+    "log_file": "logs/auto_renamer.log",
+    "log_level": "DEBUG",
+    "openrouter_api_key": "YOUR_OPENROUTER_KEY_HERE",
+    "openrouter_max_tokens": 80000,
+    "openrouter_model": "google/gemini-2.0-flash-001",
+    "output_folder": "C:/Path/To/Output",
+    "telegram_bot_token": "YOUR_TELEGRAM_TOKEN_HERE",
+    "telegram_chat_id": "YOUR_CHAT_ID_HERE",
+    "timezone_offset_hours": 3,
+    "video_extensions": [
+        ".mp4",
+        ".mkv",
+        ".mov",
+        ".avi",
+        ".flv",
+        ".wmv"
+    ],
+    "watch_folder": "C:/Path/To/Watch"
+}
