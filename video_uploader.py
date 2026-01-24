@@ -593,7 +593,8 @@ Format:
                     "job_id": job_id,
                     "speaker_id": speaker,
                     "file_name": file_name,
-                    "current_name": display_name
+                    "current_name": display_name,
+                    "all_speakers": sorted(list(speakers))
                 }
             # Requirement 5: Clearer Labels (Label + Current Name)
             button_text = f"👤 {speaker}: {display_name}" if speaker != display_name else f"👤 {speaker}"

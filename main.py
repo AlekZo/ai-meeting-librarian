@@ -183,8 +183,9 @@ class AutoMeetingVideoRenamer:
             return
         meeting_tab = self.config.get("google_sheets_meeting_tab", "Meeting_Logs")
         project_tab = self.config.get("google_sheets_project_tab", "Project_Config")
+        type_tab = self.config.get("google_sheets_type_tab", "Meeting_Types")
         try:
-            self.sheets_handler.ensure_tabs_and_headers(sheet_id, meeting_tab, project_tab)
+            self.sheets_handler.ensure_tabs_and_headers(sheet_id, meeting_tab, project_tab, type_tab)
         except Exception as e:
             logger.error(f"Failed to ensure Sheets tabs/headers: {e}")
     
@@ -519,7 +520,8 @@ class AutoMeetingVideoRenamer:
                 "job_id": job_id,
                 "speaker_id": speaker_id,
                 "file_name": file_name,
-                "current_name": current_name
+                "current_name": current_name,
+                "all_speakers": cb_data.get("all_speakers", [])
             }
 
             # Ask for the new name using ForceReply
@@ -554,6 +556,12 @@ class AutoMeetingVideoRenamer:
             
             if not success:
                 self.uploader._send_telegram_notification(f"❌ Failed to update speaker for job {job_id}")
+            else:
+                # REFRESH MENU: Show the list again so user can continue editing
+                all_speakers = cb_data.get("all_speakers", [])
+                file_name = cb_data.get("file_name", "Meeting")
+                dummy_transcript = {"title": file_name}
+                self.uploader._offer_manual_speaker_assignment(job_id, all_speakers, dummy_transcript)
 
         elif cb_data["action"] == "offer_swap":
             job_id = cb_data["job_id"]
@@ -818,7 +826,9 @@ class AutoMeetingVideoRenamer:
                 "action": "confirm_rename",
                 "job_id": job_id,
                 "speaker_id": speaker_id,
-                "new_name": new_name
+                "new_name": new_name,
+                "file_name": user_state.get("file_name"),
+                "all_speakers": user_state.get("all_speakers", [])
             }
             self.callback_map[cb_id_no] = {"action": "skip", "file_path": "rename_cancel"}
             self.callback_persistence.save(self.callback_map)
@@ -1003,16 +1013,32 @@ class AutoMeetingVideoRenamer:
             speakers = self.uploader._extract_speakers(transcript_data)
             speakers_str = ", ".join(sorted(list(speakers))) if speakers else ""
 
-            # 3. Определение Типа Встречи (Meeting Type)
+            # 3. Определение Типа Встречи (ДИНАМИЧЕСКИ ИЗ ТАБЛИЦЫ)
+            type_tab = self.config.get("google_sheets_type_tab", "Meeting_Types")
+            meeting_types_config = self.sheets_handler.read_meeting_types_config(sheet_id, type_tab)
+            
+            meeting_name = (meeting_info or {}).get("meeting_name", "")
             meeting_type = "General"
             if trimmed_text:
-                type_prompt = (
-                    "Classify this meeting into one of these categories: "
-                    "Daily Standup, Sprint Planning, Retrospective, Client Meeting, "
-                    "Technical Discussion, 1:1, Demo, Webinar, or Brainstorming. "
-                    "Return ONLY the category name.\n\n"
-                    f"Transcript Start:\n{trimmed_text[:2000]}"
-                )
+                if meeting_types_config:
+                    types_desc = "\n".join([f"- {t[0]}: {t[1]}" for t in meeting_types_config])
+                    type_prompt = (
+                        "Classify this meeting into one of the following categories based on their descriptions:\n"
+                        f"{types_desc}\n\n"
+                        f"Meeting Name: {meeting_name}\n\n"
+                        "Return ONLY the category name exactly as listed above.\n"
+                        "If none match perfectly, choose the closest one.\n\n"
+                        f"Transcript Start:\n{trimmed_text[:2000]}"
+                    )
+                else:
+                    type_prompt = (
+                        "Classify this meeting: Daily Standup, Sprint Planning, Retrospective, "
+                        "Client Meeting, Technical Discussion, 1:1, Demo, Webinar.\n"
+                        f"Meeting Name: {meeting_name}\n\n"
+                        "Return ONLY the category name.\n\n"
+                        f"Transcript Start:\n{trimmed_text[:2000]}"
+                    )
+                
                 meeting_type = self.uploader._get_openrouter_response(type_prompt)
                 meeting_type = str(meeting_type).strip(" .")
 
@@ -1032,7 +1058,7 @@ class AutoMeetingVideoRenamer:
 
             # Подготовка данных для таблицы
             meeting_time = (meeting_info or {}).get("meeting_time", "")
-            meeting_name = (meeting_info or {}).get("meeting_name", "")
+            # meeting_name already extracted above
             video_source_link = (meeting_info or {}).get("video_source_link", "")
             if video_source_link:
                 video_source_link = f'=HYPERLINK("{video_source_link}", "Link")'

@@ -112,11 +112,32 @@ class SheetsDriveHandler:
                 projects.append((name, keywords))
         return projects
 
+    def read_meeting_types_config(self, spreadsheet_id: str, sheet_name: str) -> List[Tuple[str, str]]:
+        self._ensure_services()
+        range_name = f"{sheet_name}!A2:B"
+        result = (
+            self.sheets_service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=range_name)
+            .execute()
+        )
+        values = result.get("values", [])
+        types = []
+        for row in values:
+            if not row:
+                continue
+            name = row[0].strip() if len(row) > 0 else ""
+            desc = row[1].strip() if len(row) > 1 else ""
+            if name:
+                types.append((name, desc))
+        return types
+
     def ensure_tabs_and_headers(
         self,
         spreadsheet_id: str,
         meeting_tab: str,
         project_tab: str,
+        type_tab: str,
     ) -> None:
         """Ensure required tabs exist with headers."""
         self._ensure_services()
@@ -128,6 +149,8 @@ class SheetsDriveHandler:
             requests.append({"addSheet": {"properties": {"title": meeting_tab}}})
         if project_tab not in existing_tabs:
             requests.append({"addSheet": {"properties": {"title": project_tab}}})
+        if type_tab not in existing_tabs:
+            requests.append({"addSheet": {"properties": {"title": type_tab}}})
 
         if requests:
             self.sheets_service.spreadsheets().batchUpdate(
@@ -148,6 +171,7 @@ class SheetsDriveHandler:
             "Status",
         ]]
         project_headers = [["Project Name", "Keywords / Context"]]
+        type_headers = [["Type Name", "Description / AI Prompt"]]
 
         self.sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
@@ -161,6 +185,13 @@ class SheetsDriveHandler:
             range=f"{project_tab}!A1:B1",
             valueInputOption="RAW",
             body={"values": project_headers},
+        ).execute()
+
+        self.sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{type_tab}!A1:B1",
+            valueInputOption="RAW",
+            body={"values": type_headers},
         ).execute()
 
     def upload_transcript(self, file_path: str, folder_id: str | None) -> str:
