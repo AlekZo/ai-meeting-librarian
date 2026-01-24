@@ -295,15 +295,12 @@ class VideoUploader:
                 else:
                     save_path = original_file_path
 
-                transcript_path = self._save_transcript_file(save_path, transcript_data)
-                
-                if not is_manual_refresh:
-                    self._append_to_log(original_file_path, "TRANSCRIPT_SAVED", 200, "Success")
+                # Save the human-readable version locally
+                transcript_path = self._save_transcript_file(save_path, transcript_data, job_id=job_id)
                 
                 if hasattr(self, 'main_app'):
                     meeting_info = self.meeting_info_by_job.pop(job_id, None)
                     # If finalize=False but we are skipping interaction (e.g. no Telegram token), we must treat it as final.
-                    # However, here we check if we should finalize based on the 'finalize' argument or if it's a manual refresh.
                     is_final_call = finalize
                     if not finalize and not self.config.get("telegram_bot_token"):
                         is_final_call = True
@@ -317,7 +314,7 @@ class VideoUploader:
                         is_final=is_final_call
                     )
                 
-                if is_manual_refresh:
+                if is_manual_refresh and finalize:
                     self._send_telegram_notification(f"✅ Transcript finalized and published for {transcript_data.get('title', 'meeting')}")
             else:
                 logger.error(f"Failed to download transcript for {job_id}: {response.status_code if response else 'no response'}")
@@ -721,7 +718,7 @@ Format:
             logger.error(f"Error updating Scriberr speakers: {str(e)}")
         return False
 
-    def _save_transcript_file(self, original_file_path, transcript_data):
+    def _save_transcript_file(self, original_file_path, transcript_data, job_id=None):
         """
         Saves the transcript to a .txt file, merging continuous speech 
         by the same speaker into single blocks with timestamps.
@@ -753,6 +750,11 @@ Format:
                         f.write(str(transcript_text))
                 return str(transcript_path)
 
+            # Get speaker mappings if available
+            mapping = {}
+            if job_id and hasattr(self, 'main_app'):
+                mapping = self.main_app.active_mappings.get(job_id, {})
+
             cleaned_lines = []
             current_speaker = None
             current_start_time = 0.0
@@ -764,8 +766,11 @@ Format:
                 if not text:
                     continue
 
+                # Apply mapping if exists
+                display_speaker = mapping.get(speaker, speaker)
+
                 # Check if speaker changed
-                if current_speaker is not None and speaker != current_speaker:
+                if current_speaker is not None and display_speaker != current_speaker:
                     # Save previous block
                     mins, secs = divmod(int(current_start_time), 60)
                     time_str = f"[{mins:02d}:{secs:02d}]"
@@ -780,7 +785,7 @@ Format:
                 if current_speaker is None:
                     current_start_time = start
 
-                current_speaker = speaker
+                current_speaker = display_speaker
                 current_buffer.append(text)
 
             # Flush final buffer

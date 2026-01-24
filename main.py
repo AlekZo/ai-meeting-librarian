@@ -269,8 +269,14 @@ class AutoMeetingVideoRenamer:
         buttons = []
         for i, meeting in enumerate(meetings[:5]):
             title = meeting.get('summary', 'Unknown')
+            meeting_time = meeting.get('start', {}).get('dateTime') or meeting.get('start', {}).get('date')
             cb_id = f"sel_{int(time.time())}_{i}"
-            self.callback_map[cb_id] = {"action": "select", "title": title, "file_path": file_path}
+            self.callback_map[cb_id] = {
+                "action": "select", 
+                "title": title, 
+                "file_path": file_path,
+                "meeting_time": meeting_time
+            }
             buttons.append([{"text": title, "callback_data": cb_id}])
 
         cancel_id = f"skip_{int(time.time())}"
@@ -444,6 +450,7 @@ class AutoMeetingVideoRenamer:
         if cb_data["action"] == "select":
             meeting_title = cb_data["title"]
             file_path = cb_data["file_path"]
+            meeting_time = cb_data.get("meeting_time")
             logger.info(f"User selected meeting via Telegram: {meeting_title} for {file_path}")
             self.uploader._send_telegram_notification(f"✅ Selected: {meeting_title}. Processing...")
             
@@ -454,7 +461,7 @@ class AutoMeetingVideoRenamer:
                 json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
             )
             
-            threading.Thread(target=self._process_file_with_title, args=(file_path, meeting_title)).start()
+            threading.Thread(target=self._process_file_with_title, args=(file_path, meeting_title, meeting_time)).start()
             
         elif cb_data["action"] == "retry":
             file_path = cb_data["file_path"]
@@ -675,7 +682,7 @@ class AutoMeetingVideoRenamer:
             else:
                 self.uploader._send_telegram_notification("⚠️ Could not refresh transcript automatically. Please check Scriberr.")
 
-    def _process_file_with_title(self, file_path, meeting_title):
+    def _process_file_with_title(self, file_path, meeting_title, meeting_time=None):
         """Process file when title is manually selected"""
         filename = os.path.basename(file_path)
         _, timestamp_str = FileRenamer.extract_timestamp_from_filename(filename)
@@ -689,6 +696,8 @@ class AutoMeetingVideoRenamer:
             result = {
                 'success': True,
                 'new_path': new_path,
+                'meeting_title': meeting_title,
+                'meeting_time': meeting_time,
                 'message': f"Manually renamed to {meeting_title}"
             }
             self.handle_successful_rename(result, file_path)
@@ -954,6 +963,8 @@ class AutoMeetingVideoRenamer:
                         "meeting_time": result.get("meeting_time"),
                         "video_source_link": f"file:///{destination_path}",
                     }
+                    # Store meeting_info in the uploader's map immediately
+                    # This ensures it's available even if the job takes a long time
                     self.uploader.upload_video(destination_path, meeting_info=meeting_info)
                 
                 logger.info(f"Deleting renamed file from watch folder: {new_path}")
@@ -1023,14 +1034,19 @@ class AutoMeetingVideoRenamer:
             transcript_drive_link = self.sheets_handler.upload_transcript(transcript_path, drive_folder_id)
 
             # Подготовка текста для AI
-            full_transcript_text = self._build_full_transcript_text(transcript_data)
+            full_transcript_text = self._build_full_transcript_text(transcript_data, job_id=job_id)
             trimmed_text = self._trim_transcript_for_openrouter(full_transcript_text)
 
             # 2. Извлечение Спикеров
             speakers = self.uploader._extract_speakers(transcript_data)
             
-            # Apply manual renames from Telegram
-            mapping = self.active_mappings.get(job_id, {})
+            # Apply mappings: Priority Manual > AI Initial > Original
+            mapping = {}
+            if job_id in self.initial_speaker_mappings:
+                mapping.update(self.initial_speaker_mappings[job_id])
+            if job_id in self.active_mappings:
+                mapping.update(self.active_mappings[job_id])
+                
             final_speakers = []
             for s in speakers:
                 if s in mapping:
@@ -1044,21 +1060,30 @@ class AutoMeetingVideoRenamer:
             type_tab = self.config.get("google_sheets_type_tab", "Meeting_Types")
             meeting_types_config = self.sheets_handler.read_meeting_types_config(sheet_id, type_tab)
             
-            meeting_name = (meeting_info or {}).get("meeting_name", "")
-            meeting_time = (meeting_info or {}).get("meeting_time", "")
+            # Use meeting_info if available, otherwise fallback to extracted values
+            meeting_name = (meeting_info or {}).get("meeting_name")
+            meeting_time = (meeting_info or {}).get("meeting_time")
 
             # Fallback logic: if meeting_info is missing, extract from filename
             if not meeting_name or not meeting_time:
                 filename = os.path.basename(original_file_path)
+                # Try to extract from the filename which should already be renamed
+                # Format: Title_YYYY-MM-DD_HH-MM-SS.mp4
                 dt_obj, timestamp_str = FileRenamer.extract_timestamp_from_filename(filename)
                 
-                if not meeting_name and timestamp_str:
-                    # Extract meeting name from part before timestamp (Title_YYYY-MM-DD_HH-MM-SS.mp4)
-                    meeting_name = filename.split(f"_{timestamp_str}")[0].replace("_", " ")
-                
-                if not meeting_time and dt_obj:
-                    # Use extracted datetime object as meeting_time (ISO format for later parsing)
-                    meeting_time = dt_obj.isoformat()
+                if timestamp_str:
+                    # The part before the first underscore of the timestamp is the title
+                    # But extract_timestamp_from_filename only gives us the DT.
+                    # Let's try to split by the timestamp string.
+                    parts = filename.split(f"_{timestamp_str}")
+                    if not meeting_name and len(parts) > 0:
+                        meeting_name = parts[0].replace("_", " ")
+                    
+                    if not meeting_time and dt_obj:
+                        meeting_time = dt_obj.isoformat()
+            
+            # Ensure we have values for the log even if fallback failed
+            meeting_name = meeting_name or "Unknown Meeting"
 
             meeting_type = "General"
             if trimmed_text:
@@ -1095,15 +1120,18 @@ class AutoMeetingVideoRenamer:
                     f"Transcript:\n{trimmed_text}"
                 )
                 summary = self.uploader._get_openrouter_response(summary_prompt)
+                # Clean up summary from any AI chatter
+                summary = str(summary).strip().replace('"', '')
 
             # Определение проекта (существующая логика)
             projects = self.sheets_handler.read_project_config(sheet_id, project_tab)
             project_tag = self._identify_project_tag(projects, trimmed_text)
 
             # Подготовка данных для таблицы
-            meeting_time = (meeting_info or {}).get("meeting_time", "")
+            # meeting_time and meeting_name are already set above
             
             # Format meeting_time to M/D/YYYY HH:MM:SS with +3 TZ offset
+            formatted_meeting_time = ""
             if meeting_time:
                 try:
                     # Google Calendar returns ISO format: 2026-01-22T20:00:00+03:00 or 2026-01-22T20:00:00Z
@@ -1118,28 +1146,29 @@ class AutoMeetingVideoRenamer:
                     dt_target = dt.astimezone(target_tz)
                     
                     # Format: M/D/YYYY HH:MM:SS (e.g., 1/22/2026 20:00:00)
-                    # %m/%d/%Y includes leading zeros (01/22/2026). 
-                    # To remove leading zeros on Windows, use %#m/%#d/%Y.
-                    meeting_time = dt_target.strftime("%#m/%#d/%Y %H:%M:%S")
+                    formatted_meeting_time = dt_target.strftime("%m/%d/%Y %H:%M:%S")
                 except Exception as e:
                     logger.error(f"Error formatting meeting_time '{meeting_time}': {e}")
+                    formatted_meeting_time = str(meeting_time)
 
             # meeting_name already extracted above
             video_source_link = (meeting_info or {}).get("video_source_link", "")
             if video_source_link:
                 video_source_link = f'=HYPERLINK("{video_source_link}", "Link")'
             scribber_link = f"{self.uploader.base_url}/audio/{job_id}"
+            scribber_link_formula = f'=HYPERLINK("{scribber_link}", "Scriberr")'
+            drive_link_formula = f'=HYPERLINK("{transcript_drive_link}", "Google Doc")'
 
             item = {
-                "meeting_time": meeting_time,
+                "meeting_time": formatted_meeting_time,
                 "meeting_name": meeting_name,
                 "meeting_type": meeting_type,
                 "speakers": speakers_str,
                 "summary": summary,
                 "project_tag": project_tag,
                 "video_source_link": video_source_link,
-                "scribber_link": scribber_link,
-                "transcript_drive_link": transcript_drive_link,
+                "scribber_link": scribber_link_formula,
+                "transcript_drive_link": drive_link_formula,
                 "status": "Processed",
             }
 
@@ -1164,19 +1193,28 @@ class AutoMeetingVideoRenamer:
                 }
                 self.meeting_queue.enqueue(item)
 
-    def _build_full_transcript_text(self, transcript_data):
+    def _build_full_transcript_text(self, transcript_data, job_id=None):
         segments = []
         if isinstance(transcript_data, dict):
             segments = self.uploader._find_segments(transcript_data) or []
+        
+        # Get speaker mappings if available
+        mapping = {}
+        if job_id:
+            mapping = self.active_mappings.get(job_id, {})
+
         lines = []
         for segment in segments:
             speaker = segment.get("speaker", "Unknown")
+            # Apply mapping if exists
+            display_speaker = mapping.get(speaker, speaker)
+            
             text = segment.get("text", "").strip()
             start = segment.get("start", 0.0)
             if text:
                 minutes = int(start) // 60
                 seconds = int(start) % 60
-                lines.append(f"[{minutes:02d}:{seconds:02d}] {speaker}: {text}")
+                lines.append(f"[{minutes:02d}:{seconds:02d}] {display_speaker}: {text}")
         return "\n\n".join(lines)
 
     def _trim_transcript_for_openrouter(self, text: str) -> str:
