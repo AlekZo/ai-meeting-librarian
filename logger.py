@@ -31,6 +31,7 @@ def setup_logging(log_file="logs/auto_renamer.log", level=logging.INFO):
     try:
         file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(level)
+        file_handler.flush()  # Flush immediately
         file_formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'

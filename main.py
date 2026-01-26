@@ -14,6 +14,7 @@ import signal
 import time
 import socket
 import threading
+import traceback
 from datetime import datetime, timedelta
 try:
     from setproctitle import setproctitle
@@ -1030,6 +1031,29 @@ class AutoMeetingVideoRenamer:
                 logger.warning("Sheet ID or transcript path missing; skipping meeting log publish")
                 return
 
+            # Apply speaker mappings to transcript_data before upload
+            mapping = {}
+            if job_id in self.initial_speaker_mappings:
+                mapping.update(self.initial_speaker_mappings[job_id])
+            if job_id in self.active_mappings:
+                mapping.update(self.active_mappings[job_id])
+
+            if mapping:
+                logger.info(f"Applying speaker mappings to transcript for job {job_id}")
+                for segment in transcript_data.get("segments", []):
+                    speaker_id = segment.get("speaker")
+                    if speaker_id in mapping:
+                        segment["speaker"] = mapping[speaker_id]
+                
+                # Overwrite the local transcript file with updated names
+                try:
+                    import json
+                    with open(transcript_path, 'w', encoding='utf-8') as f:
+                        json.dump(transcript_data, f, ensure_ascii=False, indent=2)
+                    logger.info(f"Updated local transcript file with speaker names: {transcript_path}")
+                except Exception as e:
+                    logger.error(f"Failed to overwrite transcript file: {e}")
+
             # 1. Загрузка транскрипта (теперь создает Google Doc)
             transcript_drive_link = self.sheets_handler.upload_transcript(transcript_path, drive_folder_id)
 
@@ -1040,13 +1064,7 @@ class AutoMeetingVideoRenamer:
             # 2. Извлечение Спикеров
             speakers = self.uploader._extract_speakers(transcript_data)
             
-            # Apply mappings: Priority Manual > AI Initial > Original
-            mapping = {}
-            if job_id in self.initial_speaker_mappings:
-                mapping.update(self.initial_speaker_mappings[job_id])
-            if job_id in self.active_mappings:
-                mapping.update(self.active_mappings[job_id])
-                
+            # Final speakers list for the spreadsheet cell
             final_speakers = []
             for s in speakers:
                 if s in mapping:
@@ -1113,10 +1131,11 @@ class AutoMeetingVideoRenamer:
             summary = ""
             if trimmed_text:
                 summary_prompt = (
-                    "Analyze the following meeting transcript. "
-                    "1. Detect the language used (e.g., English, Russian). "
-                    "2. Write a VERY concise summary (1-2 sentences MAX) in that SAME language. "
-                    "Focus only on the core topic and key outcome.\n\n"
+                    "Analyze the following meeting transcript.\n"
+                    "1. Detect the language used (e.g., English, Russian).\n"
+                    "2. Write a concise summary (1-2 sentences) in that SAME language.\n"
+                    "3. Provide a bulleted list of specific key discussion topics (Key Discussion Topics).\n"
+                    "Ensure the output is neatly formatted for a spreadsheet cell.\n\n"
                     f"Transcript:\n{trimmed_text}"
                 )
                 summary = self.uploader._get_openrouter_response(summary_prompt)
@@ -1261,21 +1280,64 @@ def signal_handler(signum, frame):
     logger.info("Signal received, initiating shutdown...")
     sys.exit(0)
 
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    """Handle any unhandled exceptions"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    
+    # Try to log the exception
+    try:
+        error_msg = f"UNCAUGHT EXCEPTION: {exc_type.__name__}: {exc_value}"
+        logger.critical(error_msg)
+        logger.critical("".join(traceback.format_tb(exc_traceback)))
+        # Flush the log file immediately
+        for handler in logging.root.handlers:
+            handler.flush()
+    except:
+        pass
+    
+    # Also print to console
+    print(f"\n{'='*60}")
+    print(f"FATAL ERROR - Application crashed!")
+    print(f"{'='*60}")
+    print(f"{exc_type.__name__}: {exc_value}")
+    print(f"{'='*60}")
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+    print(f"Check logs/auto_renamer.log for details")
+    print(f"{'='*60}\n")
+
 def main():
     """Main entry point"""
-    # Setup logging
-    log_file = os.path.join(PROJECT_ROOT, "logs", "auto_renamer.log")
-    setup_logging(log_file)
-    
-    # Register signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Create and run application
-    app = AutoMeetingVideoRenamer()
-    success = app.run()
-    
-    sys.exit(0 if success else 1)
+    try:
+        # Setup logging
+        log_file = os.path.join(PROJECT_ROOT, "logs", "auto_renamer.log")
+        setup_logging(log_file)
+        
+        # Install global exception handler
+        sys.excepthook = global_exception_handler
+        
+        logger.info("=" * 50)
+        logger.info("Application starting...")
+        logger.info("=" * 50)
+        
+        # Register signal handlers
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Create and run application
+        app = AutoMeetingVideoRenamer()
+        success = app.run()
+        
+        sys.exit(0 if success else 1)
+    except Exception as e:
+        try:
+            logger.exception(f"Fatal error during startup: {e}")
+        except:
+            print(f"FATAL ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

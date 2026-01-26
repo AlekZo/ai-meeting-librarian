@@ -8,7 +8,7 @@ from pathlib import Path
 
 # Default configuration values
 DEFAULT_CONFIG = {
-    "watch_folder": r"D:\Nextcloud\Videos\ScreenRecordings\NameIsSynced",
+    "watch_folder": r"D:\Nextcloud\Videos\ScreenRecordings\JustRecorded",
     "google_credentials_path": "credentials.json",
     "google_token_path": "token.json",
     "video_extensions": [".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv"],
