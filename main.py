@@ -48,7 +48,8 @@ class AutoMeetingVideoRenamer:
         if setproctitle:
             setproctitle("AutoMeetingVideoRenamer")
         self.config = config
-        self.monitor = None
+        self.monitor = None  # Monitor for watch_folder (renaming)
+        self.transcribe_monitor = None  # Monitor for to_transcribe_folder (transcription)
         self.calendar = None
         self.uploader = VideoUploader(self.config)
         self.uploader.main_app = self # Allow uploader to access callback_map
@@ -131,7 +132,7 @@ class AutoMeetingVideoRenamer:
             logger.error(f"Configuration error: {e}")
             return False
         
-        # Initialize file monitor first (doesn't require internet)
+        # Initialize file monitor for watch_folder (renaming) - doesn't require internet
         try:
             watch_folder = self.config.get("watch_folder")
             video_extensions = self.config.get("video_extensions")
@@ -141,9 +142,24 @@ class AutoMeetingVideoRenamer:
                 video_extensions,
                 self.on_video_created
             )
-            logger.info(f"File monitor initialized for: {watch_folder}")
+            logger.info(f"File monitor initialized for watch_folder (renaming): {watch_folder}")
         except Exception as e:
             logger.error(f"Failed to initialize file monitor: {e}")
+            return False
+        
+        # Initialize file monitor for to_transcribe_folder (transcription) - doesn't require internet
+        try:
+            to_transcribe_folder = self.config.get("to_transcribe_folder")
+            video_extensions = self.config.get("video_extensions")
+            
+            self.transcribe_monitor = FileMonitor(
+                to_transcribe_folder,
+                video_extensions,
+                self.on_video_for_transcription
+            )
+            logger.info(f"File monitor initialized for to_transcribe_folder (transcription): {to_transcribe_folder}")
+        except Exception as e:
+            logger.error(f"Failed to initialize transcribe monitor: {e}")
             return False
         
         # Initialize Google Calendar handler (requires internet)
@@ -193,12 +209,13 @@ class AutoMeetingVideoRenamer:
     
     def on_video_created(self, file_path):
         """
-        Callback when a new video file is created
+        Callback when a new video file is created in watch_folder
+        Handles: Renaming based on Google Calendar meeting
         
         Args:
             file_path: Path to the newly created video file
         """
-        logger.info(f"Processing video file: {file_path}")
+        logger.info(f"[WATCH_FOLDER] Processing video file for renaming: {file_path}")
 
         if not self._is_file_ready(file_path):
             return
@@ -207,12 +224,12 @@ class AutoMeetingVideoRenamer:
             return
 
         filename = os.path.basename(file_path)
-        dt, timestamp_str = FileRenamer.extract_timestamp_from_filename(filename)
+        dt, timestamp_str, format_type = FileRenamer.extract_timestamp_from_filename(filename)
         if not dt or not timestamp_str:
             logger.warning(f"Could not process file {file_path} automatically.")
             return
 
-        meetings = self._get_meetings_for_timestamp(dt)
+        meetings = self._get_meetings_for_timestamp(dt, format_type)
         if not meetings:
             self._notify_no_meeting(file_path, filename)
             return
@@ -225,6 +242,60 @@ class AutoMeetingVideoRenamer:
         meeting_start = meetings[0].get('start', {}).get('dateTime') or meetings[0].get('start', {}).get('date')
         logger.info(f"Found meeting: {meeting_title}")
         self._rename_with_title(file_path, meeting_title, timestamp_str, meeting_start)
+
+    def on_video_for_transcription(self, file_path):
+        """
+        Callback when a new video file is created in to_transcribe_folder
+        Handles: Uploading to transcription service and processing
+        
+        Args:
+            file_path: Path to the video file ready for transcription
+        """
+        logger.info(f"[TO_TRANSCRIBE_FOLDER] Processing video file for transcription: {file_path}")
+
+        if not self._is_file_ready(file_path):
+            return
+
+        if self._queue_if_offline(file_path):
+            return
+
+        filename = os.path.basename(file_path)
+        
+        # Extract meeting info from filename
+        # Expected format: "Meeting Title_YYYY-MM-DD_HH-MM-SS.mp4"
+        dt, timestamp_str, format_type = FileRenamer.extract_timestamp_from_filename(filename)
+        
+        if not dt or not timestamp_str:
+            logger.warning(f"Could not extract timestamp from filename: {filename}")
+            self.uploader._send_telegram_notification(
+                f"⚠️ Could not extract meeting time from filename: {filename}\n"
+                f"Expected format: 'Meeting Title_YYYY-MM-DD_HH-MM-SS.mp4'"
+            )
+            return
+
+        # Extract meeting title from filename (everything before the timestamp)
+        # Format: "Title_YYYY-MM-DD_HH-MM-SS.mp4"
+        parts = filename.split(f"_{timestamp_str}")
+        if len(parts) > 0:
+            meeting_title = parts[0].replace("_", " ")
+        else:
+            meeting_title = "Unknown Meeting"
+
+        logger.info(f"Extracted meeting info - Title: {meeting_title}, Time: {dt}")
+        
+        # Upload to transcription service
+        meeting_info = {
+            "meeting_name": meeting_title,
+            "meeting_time": dt.isoformat() if dt else datetime.now().isoformat(),
+            "video_source_link": f"file:///{file_path}",
+        }
+        
+        logger.info(f"Uploading file to transcription service: {file_path}")
+        self.uploader._send_telegram_notification(
+            f"📤 Starting transcription for: {meeting_title}"
+        )
+        
+        self.uploader.upload_video(file_path, meeting_info=meeting_info)
 
     def _is_file_ready(self, file_path):
         file_lock_delay = self.config.get("file_lock_check_delay", 2)
@@ -242,43 +313,88 @@ class AutoMeetingVideoRenamer:
             return True
         return False
 
-    def _get_meetings_for_timestamp(self, dt):
+    def _get_meetings_for_timestamp(self, dt, format_type=None):
         timezone_offset = self.config.get("timezone_offset_hours", 0)
-        dt_utc = dt - timedelta(hours=timezone_offset)
+        # For date-only filenames, don't apply timezone offset
+        if format_type == "date-only":
+            dt_utc = dt
+        else:
+            dt_utc = dt - timedelta(hours=timezone_offset)
         return self.calendar.get_meetings_at_time(dt_utc)
 
     def _notify_no_meeting(self, file_path, filename):
-        logger.warning(f"No meetings found for {filename}. Sending Telegram notification.")
-        cb_id = f"retry_{int(time.time())}"
-        self.callback_map[cb_id] = {"action": "retry", "file_path": file_path}
-        cancel_id = f"skip_{int(time.time())}"
-        self.callback_map[cancel_id] = {"action": "skip", "file_path": file_path}
-        self.callback_persistence.save(self.callback_map)
+        logger.warning(f"No meetings found for {filename}. Fetching all meetings on that date.")
+        
+        # Extract the date from filename
+        dt, _, format_type = FileRenamer.extract_timestamp_from_filename(filename)
+        if not dt:
+            logger.error(f"Could not extract date from filename: {filename}")
+            return
+        
+        # Get all meetings on that date
+        # For date-only filenames, don't apply timezone offset (the date is already in local time)
+        # For timestamped filenames, convert to UTC using timezone offset
+        timezone_offset = self.config.get("timezone_offset_hours", 0)
+        if format_type == "date-only":
+            dt_utc = dt
+            logger.debug(f"Date-only format: using {dt.date()} without timezone offset")
+        else:
+            dt_utc = dt - timedelta(hours=timezone_offset)
+            logger.debug(f"Timestamped format: converting {dt} to UTC with offset {timezone_offset}h")
+        all_meetings = self.calendar.get_all_meetings_on_date(dt_utc)
+        
+        if not all_meetings:
+            # No meetings on that date at all
+            logger.warning(f"No meetings found on {dt.date()} for {filename}. Sending notification.")
+            cb_id = f"retry_{int(time.time())}"
+            self.callback_map[cb_id] = {"action": "retry", "file_path": file_path}
+            cancel_id = f"skip_{int(time.time())}"
+            self.callback_map[cancel_id] = {"action": "skip", "file_path": file_path}
+            self.callback_persistence.save(self.callback_map)
 
-        self.uploader._send_telegram_notification(
-            f"❓ No meeting found for: {filename}\n\nPlease add it to Google Calendar and click Retry.",
-            reply_markup={
-                "inline_keyboard": [[
-                    {"text": "🔄 Retry", "callback_data": cb_id},
-                    {"text": "❌ Cancel", "callback_data": cancel_id}
-                ]]
-            }
-        )
+            self.uploader._send_telegram_notification(
+                f"❓ No meeting found for: {filename}\n\nPlease add it to Google Calendar and click Retry.",
+                reply_markup={
+                    "inline_keyboard": [[
+                        {"text": "🔄 Retry", "callback_data": cb_id},
+                        {"text": "❌ Cancel", "callback_data": cancel_id}
+                    ]]
+                }
+            )
+        else:
+            # Show all meetings on that date for user to select
+            logger.info(f"Found {len(all_meetings)} meetings on {dt.date()}. Prompting user to select.")
+            self._prompt_meeting_selection(file_path, filename, all_meetings)
 
     def _prompt_meeting_selection(self, file_path, filename, meetings):
         logger.info(f"Multiple meetings found for {filename}. Asking user to select via Telegram.")
         buttons = []
-        for i, meeting in enumerate(meetings[:5]):
+        for i, meeting in enumerate(meetings[:10]):  # Show up to 10 meetings
             title = meeting.get('summary', 'Unknown')
             meeting_time = meeting.get('start', {}).get('dateTime') or meeting.get('start', {}).get('date')
+            meeting_id = meeting.get('id', '')
+            
+            # Use short callback ID to stay within Telegram's 64-byte limit
             cb_id = f"sel_{int(time.time())}_{i}"
             self.callback_map[cb_id] = {
                 "action": "select", 
                 "title": title, 
                 "file_path": file_path,
-                "meeting_time": meeting_time
+                "meeting_time": meeting_time,
+                "meeting_id": meeting_id
             }
-            buttons.append([{"text": title, "callback_data": cb_id}])
+            
+            # Add time to button label for clarity
+            time_str = ""
+            if meeting_time:
+                try:
+                    from dateutil import parser
+                    dt = parser.parse(meeting_time)
+                    time_str = f" ({dt.strftime('%H:%M')})"
+                except:
+                    pass
+            
+            buttons.append([{"text": f"{title}{time_str}", "callback_data": cb_id}])
 
         cancel_id = f"skip_{int(time.time())}"
         self.callback_map[cancel_id] = {"action": "skip", "file_path": file_path}
@@ -665,7 +781,7 @@ class AutoMeetingVideoRenamer:
             if final_mappings:
                 logger.info(f"Applying final speaker mappings for job {job_id} before finalization")
                 self.uploader._update_scriberr_speakers(job_id, final_mappings)
-                time.sleep(1) # Give Scriberr a moment to process
+                time.sleep(2) # Give Scriberr a moment to process
 
             # Use local session data to show the final summary
             if job_id in self.active_mappings:
@@ -674,11 +790,10 @@ class AutoMeetingVideoRenamer:
                     table_lines.append(f"• {orig} ➔ **{custom}**")
                 self.uploader._send_telegram_notification("\n".join(table_lines))
 
-            self.uploader._send_telegram_notification(f"✅ Finalizing transcript for {file_name}...")
-            
             # Trigger transcript re-download and processing with finalize=True
             if transcript_data:
                 # We need to re-fetch the transcript from Scriberr to get updated names
+                # The finalization notification will be sent by _download_transcript when finalize=True
                 threading.Thread(target=self.uploader._download_transcript, args=(job_id, "manual_refresh", transcript_data, True)).start()
             else:
                 self.uploader._send_telegram_notification("⚠️ Could not refresh transcript automatically. Please check Scriberr.")
@@ -686,7 +801,7 @@ class AutoMeetingVideoRenamer:
     def _process_file_with_title(self, file_path, meeting_title, meeting_time=None):
         """Process file when title is manually selected"""
         filename = os.path.basename(file_path)
-        _, timestamp_str = FileRenamer.extract_timestamp_from_filename(filename)
+        _, timestamp_str, _ = FileRenamer.extract_timestamp_from_filename(filename)
         
         dry_run = self.config.get("dry_run", False)
         new_path = FileRenamer.generate_new_filename_from_timestamp(
@@ -753,8 +868,13 @@ class AutoMeetingVideoRenamer:
             # Flush any queued meeting logs on startup
             self.flush_meeting_queue()
             
-            # Start file monitoring
+            # Start file monitoring for watch_folder (renaming)
             self.monitor.start()
+            logger.info("✓ Watch folder monitor started")
+            
+            # Start file monitoring for to_transcribe_folder (transcription)
+            self.transcribe_monitor.start()
+            logger.info("✓ Transcribe folder monitor started")
             
             # Start internet monitoring in a separate thread
             import threading
@@ -771,7 +891,13 @@ class AutoMeetingVideoRenamer:
             )
             telegram_thread.start()
             
+            logger.info("=" * 60)
             logger.info("Auto-Meeting Video Renamer is running...")
+            logger.info("=" * 60)
+            logger.info(f"📁 Watch folder (renaming): {self.config.get('watch_folder')}")
+            logger.info(f"📁 Transcribe folder: {self.config.get('to_transcribe_folder')}")
+            logger.info(f"📁 Transcribed folder: {self.config.get('transcribed_folder')}")
+            logger.info("=" * 60)
             logger.info("Press Ctrl+C to exit")
             
             # Keep the application running
@@ -793,6 +919,11 @@ class AutoMeetingVideoRenamer:
         
         if self.monitor:
             self.monitor.stop()
+            logger.info("✓ Watch folder monitor stopped")
+        
+        if self.transcribe_monitor:
+            self.transcribe_monitor.stop()
+            logger.info("✓ Transcribe folder monitor stopped")
         
         if self.calendar:
             self.calendar.close()
@@ -908,75 +1039,56 @@ class AutoMeetingVideoRenamer:
             # Run in a separate thread to not block the bot
             threading.Thread(target=self.on_video_created, args=(file_path,)).start()
             
-        elif data.startswith("select:"):
-            parts = data.split(":")
-            meeting_id = parts[1]
-            file_path = parts[2]
-            
-            # Fetch specific meeting
-            try:
-                meeting = self.calendar.service.events().get(calendarId='primary', eventId=meeting_id).execute()
-                meeting_title = meeting.get('summary', 'Unknown')
-                self.uploader._send_telegram_notification(f"✅ Selected meeting: {meeting_title}. Processing...")
+        elif data.startswith("sel_"):
+            # Fetch from callback_map
+            if data in self.callback_map:
+                cb_data = self.callback_map[data]
+                file_path = cb_data.get("file_path")
+                meeting_id = cb_data.get("meeting_id")
+                meeting_title = cb_data.get("title", "Unknown")
+                meeting_start = cb_data.get("meeting_time")
                 
-                # Extract timestamp from filename
-                filename = os.path.basename(file_path)
-                _, timestamp_str = FileRenamer.extract_timestamp_from_filename(filename)
-                
-                # Manually trigger rename with this title
-                dry_run = self.config.get("dry_run", False)
-                new_path = FileRenamer.generate_new_filename_from_timestamp(meeting_title, file_path, timestamp_str, dry_run)
-                
-                if new_path and FileRenamer.rename_file(file_path, new_path, dry_run):
-                    # Trigger the rest of the flow (copy, upload, etc)
-                    # We simulate a successful result from rename_file_with_calendar_lookup
-                    result = {
-                        'success': True,
-                        'new_path': new_path,
-                        'meeting_title': meeting_title,
-                        'meeting_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        'message': 'Manual selection successful'
-                    }
-                    self.handle_successful_rename(result, file_path)
-            except Exception as e:
-                logger.error(f"Error processing manual selection: {e}")
-                self.uploader._send_telegram_notification(f"❌ Error: {str(e)}")
+                try:
+                    self.uploader._send_telegram_notification(f"✅ Selected meeting: {meeting_title}. Processing...")
+                    
+                    # Extract timestamp from filename
+                    filename = os.path.basename(file_path)
+                    _, timestamp_str, _ = FileRenamer.extract_timestamp_from_filename(filename)
+                    
+                    # Manually trigger rename with this title
+                    dry_run = self.config.get("dry_run", False)
+                    new_path = FileRenamer.generate_new_filename_from_timestamp(meeting_title, file_path, timestamp_str, dry_run)
+                    
+                    if new_path and FileRenamer.rename_file(file_path, new_path, dry_run):
+                        result = {
+                            'success': True,
+                            'new_path': new_path,
+                            'meeting_title': meeting_title,
+                            'meeting_time': meeting_start or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            'message': 'Manual selection successful'
+                        }
+                        self.handle_successful_rename(result, file_path)
+                except Exception as e:
+                    logger.error(f"Error processing manual selection: {e}")
+                    self.uploader._send_telegram_notification(f"❌ Error: {str(e)}")
+            else:
+                logger.error(f"Callback data not found: {data}")
+                self.uploader._send_telegram_notification(f"❌ Error: Selection expired")
 
     def handle_successful_rename(self, result, original_file_path):
-        """Helper to handle the post-rename logic (copy, upload, delete)"""
+        """Helper to handle the post-rename logic"""
         logger.info(f"✓ {result['message']}")
         new_path = result['new_path']
-        output_folder = self.config.get("output_folder")
-        dry_run = self.config.get("dry_run", False)
         
-        if new_path and output_folder:
-            filename = os.path.basename(new_path)
-            destination_path = os.path.join(output_folder, filename)
-            
-            logger.info(f"Copying renamed file to output folder: {destination_path}")
-            if FileRenamer.copy_file(new_path, destination_path, dry_run):
-                logger.info(f"✓ File copied to output folder: {destination_path}")
-                
-                if self.config.get("enable_upload", False):
-                    logger.info(f"Uploading file to transcription service: {destination_path}")
-                    meeting_info = {
-                        "meeting_name": result.get("meeting_title"),
-                        "meeting_time": result.get("meeting_time"),
-                        "video_source_link": f"file:///{destination_path}",
-                    }
-                    # Store meeting_info in the uploader's map immediately
-                    # This ensures it's available even if the job takes a long time
-                    self.uploader.upload_video(destination_path, meeting_info=meeting_info)
-                
-                logger.info(f"Deleting renamed file from watch folder: {new_path}")
-                if FileRenamer.delete_file(new_path, dry_run):
-                    logger.info(f"✓ Renamed file deleted: {new_path}")
-                else:
-                    logger.warning(f"✗ Failed to delete renamed file: {new_path}")
-            else:
-                logger.warning(f"✗ Failed to copy file to output folder: {destination_path}")
-        else:
-            logger.warning("Output folder not configured, skipping copy operation")
+        # File is now renamed and stays in watch_folder
+        # User will manually move it to to_transcribe_folder to trigger transcription
+        logger.info(f"📁 File renamed and ready for transcription: {new_path}")
+        logger.info(f"📝 To transcribe this file, move it to: {self.config.get('to_transcribe_folder')}")
+        
+        self.uploader._send_telegram_notification(
+            f"✅ File renamed: {os.path.basename(new_path)}\n\n"
+            f"📝 Move it to the transcription folder to start transcription."
+        )
 
     def flush_meeting_queue(self):
         items = self.meeting_queue.dequeue_all()
@@ -1044,15 +1156,17 @@ class AutoMeetingVideoRenamer:
                     speaker_id = segment.get("speaker")
                     if speaker_id in mapping:
                         segment["speaker"] = mapping[speaker_id]
-                
-                # Overwrite the local transcript file with updated names
+
+                # Optionally save raw JSON to a separate debug file (do NOT overwrite the text transcript)
                 try:
                     import json
-                    with open(transcript_path, 'w', encoding='utf-8') as f:
+                    base, _ = os.path.splitext(transcript_path)
+                    json_path = f"{base}.json"
+                    with open(json_path, 'w', encoding='utf-8') as f:
                         json.dump(transcript_data, f, ensure_ascii=False, indent=2)
-                    logger.info(f"Updated local transcript file with speaker names: {transcript_path}")
+                    logger.info(f"Saved raw JSON transcript metadata to: {json_path}")
                 except Exception as e:
-                    logger.error(f"Failed to overwrite transcript file: {e}")
+                    logger.error(f"Failed to save debug JSON: {e}")
 
             # 1. Загрузка транскрипта (теперь создает Google Doc)
             transcript_drive_link = self.sheets_handler.upload_transcript(transcript_path, drive_folder_id)
@@ -1087,7 +1201,7 @@ class AutoMeetingVideoRenamer:
                 filename = os.path.basename(original_file_path)
                 # Try to extract from the filename which should already be renamed
                 # Format: Title_YYYY-MM-DD_HH-MM-SS.mp4
-                dt_obj, timestamp_str = FileRenamer.extract_timestamp_from_filename(filename)
+                dt_obj, timestamp_str, _ = FileRenamer.extract_timestamp_from_filename(filename)
                 
                 if timestamp_str:
                     # The part before the first underscore of the timestamp is the title
@@ -1132,9 +1246,8 @@ class AutoMeetingVideoRenamer:
             if trimmed_text:
                 summary_prompt = (
                     "Analyze the following meeting transcript.\n"
-                    "1. Detect the language used (e.g., English, Russian).\n"
-                    "2. Write a concise summary (1-2 sentences) in that SAME language.\n"
-                    "3. Provide a bulleted list of specific key discussion topics (Key Discussion Topics).\n"
+                    "1. Write a concise summary (1-2 sentences) in that SAME language.\n"
+                    "2. Provide a bulleted list of specific key discussion topics (Key Discussion Topics).\n"
                     "Ensure the output is neatly formatted for a spreadsheet cell.\n\n"
                     f"Transcript:\n{trimmed_text}"
                 )
@@ -1196,6 +1309,12 @@ class AutoMeetingVideoRenamer:
                 return
 
             self._publish_meeting_log(item)
+
+            # Notify with Google Doc link at the end
+            if transcript_drive_link:
+                self.uploader._send_telegram_notification(
+                    f"📄 Transcript (Google Doc): {transcript_drive_link}"
+                )
         except Exception as e:
             logger.error(f"Failed to publish meeting log: {e}")
             if meeting_info:

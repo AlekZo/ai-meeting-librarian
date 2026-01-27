@@ -95,6 +95,10 @@ class VideoUploader:
                     if hasattr(self, 'main_app'):
                         self.main_app.callback_map[cb_id] = {"action": "cancel", "job_id": job_id, "file_path": file_path}
                         self.main_app.callback_persistence.save(self.main_app.callback_map)
+                    
+                    # Move file to output folder after successful upload
+                    self._move_file_to_output(file_path)
+                    
                     self.start_transcription(job_id, file_path)
             else:
                 logger.error(f"Failed to upload {file_name}. Status: {response.status_code}")
@@ -102,6 +106,31 @@ class VideoUploader:
         except Exception as e:
             logger.error(f"Error during upload of {file_name}: {str(e)}")
             self._save_log(file_path, "ERROR", str(e))
+
+    def _move_file_to_output(self, file_path):
+        """Move uploaded file to transcribed folder"""
+        try:
+            transcribed_folder = self.config.get("transcribed_folder")
+            if not transcribed_folder or not os.path.exists(transcribed_folder):
+                logger.warning(f"Transcribed folder not configured or doesn't exist: {transcribed_folder}")
+                return False
+            
+            filename = os.path.basename(file_path)
+            destination_path = os.path.join(transcribed_folder, filename)
+            
+            # Check if file still exists (might have been deleted)
+            if not os.path.exists(file_path):
+                logger.warning(f"Source file no longer exists: {file_path}")
+                return False
+            
+            # Move file to transcribed folder
+            logger.info(f"Moving file to transcribed folder: {destination_path}")
+            os.rename(file_path, destination_path)
+            logger.info(f"✓ File moved to transcribed folder: {destination_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error moving file to output folder: {e}")
+            return False
 
     def start_transcription(self, job_id, original_file_path):
         # ...existing code...
@@ -245,9 +274,15 @@ class VideoUploader:
                             has_manual_renames = True
                     
                     if not has_manual_renames:
-                        # Identify speakers using OpenRouter
-                        logger.info(f"Starting speaker identification for job {job_id}")
-                        identified_speakers = self._identify_speakers(transcript_data, job_id)
+                        # Identify speakers using OpenRouter (if enabled)
+                        enable_speaker_identification = self.config.get("enable_speaker_identification", True)
+                        if enable_speaker_identification:
+                            logger.info(f"Starting speaker identification for job {job_id}")
+                            identified_speakers = self._identify_speakers(transcript_data, job_id)
+                        else:
+                            logger.info(f"Speaker identification disabled for job {job_id}")
+                            identified_speakers = None
+                        
                         if identified_speakers:
                             logger.info(f"Speakers identified: {identified_speakers}")
                             if hasattr(self, 'main_app'):
@@ -265,21 +300,25 @@ class VideoUploader:
                                 logger.warning(f"Speaker update was not applied for job {job_id}")
                         else:
                             logger.warning(f"No speakers identified for job {job_id}")
-                            # Get response from OpenRouter for the message
-                            file_name = os.path.basename(original_file_path) if not is_manual_refresh else transcript_data.get('title', 'meeting')
-                            prompt = f"The transcription job for the file '{file_name}' (ID: {job_id}) completed, but no speakers could be identified from the transcript. Please provide a short, helpful message for the user about this situation."
-                            ai_response = self._get_openrouter_response(prompt)
-                            scriberr_link = f"{self.base_url}/audio/{job_id}"
-                            self._send_telegram_notification(
-                                f"⚠️ No speakers identified for: {file_name}\n\nAI Response: {ai_response}\nView on Scriberr: {scriberr_link}"
-                            )
+                            # Only notify about missing speakers if speaker identification is enabled
+                            if enable_speaker_identification:
+                                # Get response from OpenRouter for the message
+                                file_name = os.path.basename(original_file_path) if not is_manual_refresh else transcript_data.get('title', 'meeting')
+                                prompt = f"The transcription job for the file '{file_name}' (ID: {job_id}) completed, but no speakers could be identified from the transcript. Please provide a short, helpful message for the user about this situation."
+                                ai_response = self._get_openrouter_response(prompt)
+                                scriberr_link = f"{self.base_url}/audio/{job_id}"
+                                self._send_telegram_notification(
+                                    f"⚠️ No speakers identified for: {file_name}\n\nAI Response: {ai_response}\nView on Scriberr: {scriberr_link}"
+                                )
 
-                    # Always offer manual speaker assignment based on transcript data UNLESS we are in the finalize step
-                    speakers = self._extract_speakers(transcript_data)
-                    if speakers:
-                        # Re-fetch identified_speakers if we skipped identification but have manual renames
-                        # This is a bit complex, but _offer_manual_speaker_assignment handles identified_names=None fine
-                        self._offer_manual_speaker_assignment(job_id, speakers, transcript_data, identified_names=(identified_speakers if not has_manual_renames else None))
+                    # Offer manual speaker assignment based on transcript data UNLESS we are in the finalize step
+                    # OR if speaker identification is disabled
+                    if enable_speaker_identification:
+                        speakers = self._extract_speakers(transcript_data)
+                        if speakers:
+                            # Re-fetch identified_speakers if we skipped identification but have manual renames
+                            # This is a bit complex, but _offer_manual_speaker_assignment handles identified_names=None fine
+                            self._offer_manual_speaker_assignment(job_id, speakers, transcript_data, identified_names=(identified_speakers if not has_manual_renames else None))
 
                 # If manual refresh, we don't need to offer assignment again unless we want to allow multiple rounds
                 # But we DO need to save the file and trigger on_transcript_ready
@@ -287,8 +326,11 @@ class VideoUploader:
                 if is_manual_refresh and existing_transcript_data:
                     # Use the title from existing data if available
                     transcript_data['title'] = existing_transcript_data.get('title', 'meeting')
-                    # We use a dummy path or try to find the original one if we had it
-                    save_path = f"refreshed_{job_id}.txt" 
+                    # Build a readable FINAL filename for the refreshed transcript
+                    safe_title = transcript_data.get('title', 'meeting').replace(':', '').replace('/', '_')
+                    if not safe_title:
+                        safe_title = 'meeting'
+                    save_path = f"{safe_title}_FINAL.txt"
                     # Restore meeting_info from the job_id if it was lost during manual refresh
                     if job_id not in self.meeting_info_by_job and 'meeting_info' in existing_transcript_data:
                         self.meeting_info_by_job[job_id] = existing_transcript_data['meeting_info']
@@ -315,6 +357,8 @@ class VideoUploader:
                     )
                 
                 if is_manual_refresh and finalize:
+                    # Send finalization notifications
+                    self._send_telegram_notification(f"✅ Finalizing transcript for {transcript_data.get('title', 'meeting')}...")
                     self._send_telegram_notification(f"✅ Transcript finalized and published for {transcript_data.get('title', 'meeting')}")
             else:
                 logger.error(f"Failed to download transcript for {job_id}: {response.status_code if response else 'no response'}")
@@ -725,9 +769,9 @@ Format:
         """
         try:
             file_path_obj = Path(original_file_path)
-            output_folder = self.config.get("output_folder")
-            if output_folder:
-                output_dir = Path(output_folder)
+            transcribed_folder = self.config.get("transcribed_folder")
+            if transcribed_folder:
+                output_dir = Path(transcribed_folder)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 transcript_path = output_dir / f"{file_path_obj.stem}_transcript.txt"
             else:

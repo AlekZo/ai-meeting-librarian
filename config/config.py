@@ -9,6 +9,8 @@ from pathlib import Path
 # Default configuration values
 DEFAULT_CONFIG = {
     "watch_folder": r"D:\Nextcloud\Videos\ScreenRecordings\JustRecorded",
+    "to_transcribe_folder": r"D:\Nextcloud\Videos\ScreenRecordings\ToTranscribe",
+    "transcribed_folder": r"D:\Nextcloud\Videos\ScreenRecordings\Transcribed",
     "google_credentials_path": "credentials.json",
     "google_token_path": "token.json",
     "video_extensions": [".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv"],
@@ -19,18 +21,19 @@ DEFAULT_CONFIG = {
     "log_file": "logs/auto_renamer.log",
     "dry_run": False,  # Set to True to test without actually renaming files
     "timezone_offset_hours": 3,  # Local timezone offset from UTC (e.g., 3 for GMT+3)
-    "enable_upload": True,
+    "enable_upload": True,  # Enable uploading videos to transcription service
+    "enable_speaker_identification": False,  # Enable automatic speaker identification using AI
     "api_base_url": "http://localhost:8080",
-    "api_key": "",
+    "api_key": "FXlyaUoaTTYgR5fr1SDQGp8JKSAKgcF3",
     "google_sheets_id": "",
     "google_sheets_meeting_tab": "Meeting_Logs",
     "google_sheets_project_tab": "Project_Config",
     "drive_transcript_folder_id": "",
     "openrouter_max_tokens": 80000,
-    "openrouter_api_key": "",
-    "openrouter_model": "google/gemini-2.0-flash-001",
-    "telegram_bot_token": "",
-    "telegram_chat_id": "",
+    "openrouter_api_key": "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",
+    "openrouter_model": "google/gemini-2.5-flash-lite",
+    "telegram_bot_token": "8251779884:AAGLq3w8Vker8N3HrYegTBVg92lClpm07ug",
+    "telegram_chat_id": "376661128",
 }
 
 class Config:
@@ -82,6 +85,20 @@ class Config:
         
         if not os.path.isdir(watch_folder):
             raise ValueError(f"Watch path is not a directory: {watch_folder}")
+        
+        to_transcribe_folder = self.get("to_transcribe_folder")
+        if not os.path.exists(to_transcribe_folder):
+            raise ValueError(f"To transcribe folder does not exist: {to_transcribe_folder}")
+        
+        if not os.path.isdir(to_transcribe_folder):
+            raise ValueError(f"To transcribe path is not a directory: {to_transcribe_folder}")
+        
+        transcribed_folder = self.get("transcribed_folder")
+        if not os.path.exists(transcribed_folder):
+            raise ValueError(f"Transcribed folder does not exist: {transcribed_folder}")
+        
+        if not os.path.isdir(transcribed_folder):
+            raise ValueError(f"Transcribed path is not a directory: {transcribed_folder}")
         
         # Validate API settings if upload is enabled
         if self.get("enable_upload"):

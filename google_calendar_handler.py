@@ -276,6 +276,68 @@ class GoogleCalendarHandler:
         meetings = self.get_meetings_at_time(check_time, retry_attempts, retry_delay)
         return meetings[0] if meetings else None
 
+    def get_all_meetings_on_date(self, check_date, retry_attempts=3, retry_delay=2):
+        """
+        Get all meetings on a specific date (regardless of time overlap)
+        
+        Args:
+            check_date: datetime object representing the date
+            retry_attempts: Number of times to retry on network error
+            retry_delay: Seconds to wait between retries
+        
+        Returns:
+            list: List of all meeting events on that date or empty list if none found
+        """
+        if not self.service:
+            self.authenticate()
+        
+        for attempt in range(retry_attempts):
+            try:
+                if isinstance(check_date, datetime):
+                    # Create a window for the entire day
+                    from datetime import timedelta
+                    start_of_day = check_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    end_of_day = start_of_day + timedelta(days=1)
+                    time_min = start_of_day.isoformat() + 'Z'
+                    time_max = end_of_day.isoformat() + 'Z'
+                else:
+                    time_min = check_date
+                    time_max = None
+                
+                # Query for all events on the given date
+                logger.debug(f"Querying Google Calendar for all meetings on date: timeMin={time_min}, timeMax={time_max}")
+                events_result = self.service.events().list(
+                    calendarId='primary',
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    maxResults=50,
+                    singleEvents=True,
+                    orderBy='startTime'
+                ).execute()
+                
+                events = events_result.get('items', [])
+                logger.info(f"Found {len(events)} meetings on date {check_date.date() if isinstance(check_date, datetime) else check_date}")
+                return events
+            
+            except HttpError as e:
+                error_code = e.resp.status
+                if error_code in [403, 429, 500, 502, 503, 504]:
+                    if attempt < retry_attempts - 1:
+                        logger.warning(f"Google Calendar API error (attempt {attempt + 1}/{retry_attempts}): {e.resp.reason}. Retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        continue
+                logger.error(f"Google Calendar API error: {e}")
+                return []
+            except Exception as e:
+                if attempt < retry_attempts - 1:
+                    logger.warning(f"Error querying Google Calendar (attempt {attempt + 1}/{retry_attempts}): {e}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    continue
+                logger.error(f"Error querying Google Calendar after {retry_attempts} attempts: {e}")
+                return []
+        
+        return []
+
     def close(self):
         """Close the service connection"""
         if self.service:

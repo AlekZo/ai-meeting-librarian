@@ -11,8 +11,12 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-# Pattern to match timestamps in filenames like: 2026-01-22_14-26-31
-TIMESTAMP_PATTERN = r'(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})'
+# Pattern to match timestamps in filenames:
+# - 2026-01-22_14-26-31 (date with time)
+# - 2026-01-22 (date only)
+# - 2026-01-23T10:01:46Z (ISO 8601 format with timezone)
+# - 2026-01-23T10:01:46 (ISO 8601 format without timezone)
+TIMESTAMP_PATTERN = r'(\d{4})-(\d{2})-(\d{2})(?:[T_](\d{2}):(\d{2}):(\d{2})|_(\d{2})-(\d{2})-(\d{2}))?'
 
 class FileRenamer:
     """Handles file renaming logic"""
@@ -40,7 +44,11 @@ class FileRenamer:
     @staticmethod
     def extract_timestamp_from_filename(filename):
         """
-        Extract timestamp from filename pattern like: 2026-01-22_14-26-31.mp4
+        Extract timestamp from filename pattern like:
+        - 2026-01-22_14-26-31.mp4 (date with time, hyphens)
+        - 2026-01-22_DION Video.mp4 (date only)
+        - Ердакова Надежда_2026-01-23T10:01:46Z.mp4 (ISO 8601 with timezone)
+        - Ердакова Надежда_2026-01-23T10:01:46.mp4 (ISO 8601 without timezone)
         
         Args:
             filename: Filename to extract timestamp from
@@ -50,16 +58,31 @@ class FileRenamer:
         """
         match = re.search(TIMESTAMP_PATTERN, filename)
         if match:
-            year, month, day, hour, minute, second = map(int, match.groups())
+            groups = match.groups()
+            year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+            
+            # Check for ISO 8601 format with colons (groups 3, 4, 5)
+            if groups[3] is not None and groups[4] is not None and groups[5] is not None:
+                hour, minute, second = int(groups[3]), int(groups[4]), int(groups[5])
+                format_type = "ISO 8601"
+            # Check for underscore format with hyphens (groups 6, 7, 8)
+            elif groups[6] is not None and groups[7] is not None and groups[8] is not None:
+                hour, minute, second = int(groups[6]), int(groups[7]), int(groups[8])
+                format_type = "underscore with hyphens"
+            else:
+                # No time component, use midnight (00:00:00)
+                hour, minute, second = 0, 0, 0
+                format_type = "date-only"
+            
             try:
                 dt = datetime(year, month, day, hour, minute, second)
                 timestamp_str = f"{year:04d}-{month:02d}-{day:02d}_{hour:02d}-{minute:02d}-{second:02d}"
-                logger.info(f"Extracted timestamp from filename: {timestamp_str}")
-                return dt, timestamp_str
+                logger.info(f"Extracted timestamp from filename: {timestamp_str} ({format_type} format)")
+                return dt, timestamp_str, format_type
             except ValueError as e:
                 logger.warning(f"Invalid timestamp in filename: {e}")
-                return None, None
-        return None, None
+                return None, None, None
+        return None, None, None
     
     @staticmethod
     def generate_new_filename_from_timestamp(meeting_title, original_file_path, timestamp_str, dry_run=False):
@@ -306,7 +329,7 @@ class FileRenamer:
         filename = os.path.basename(file_path)
         
         # Step 1: Extract timestamp from filename
-        dt, timestamp_str = FileRenamer.extract_timestamp_from_filename(filename)
+        dt, timestamp_str, _ = FileRenamer.extract_timestamp_from_filename(filename)
         if not dt or not timestamp_str:
             message = f"Could not extract timestamp from filename: {filename}"
             logger.warning(message)
