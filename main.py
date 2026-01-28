@@ -15,6 +15,8 @@ import time
 import socket
 import threading
 import traceback
+import shutil
+import json
 from datetime import datetime, timedelta
 try:
     from setproctitle import setproctitle
@@ -70,6 +72,9 @@ class AutoMeetingVideoRenamer:
         self.user_states = {} # Track user states for ForceReply (e.g., renaming speaker)
         self.active_mappings = {} # Track all speaker renames per job_id: {job_id: {orig: custom}}
         self.initial_speaker_mappings = {} # Track AI-detected names per job_id
+
+        self.processed_watch_files_path = os.path.join(PROJECT_ROOT, "logs", "processed_watch_files.json")
+        self.processed_watch_files = self._load_processed_watch_files()
 
         self.sheets_handler = SheetsDriveHandler(
             self.config.get("google_credentials_path"),
@@ -217,6 +222,10 @@ class AutoMeetingVideoRenamer:
         """
         logger.info(f"[WATCH_FOLDER] Processing video file for renaming: {file_path}")
 
+        if self._is_already_processed_watch_file(file_path):
+            logger.info(f"Skipping already processed file: {file_path}")
+            return
+
         if not self._is_file_ready(file_path):
             return
 
@@ -312,6 +321,54 @@ class AutoMeetingVideoRenamer:
                 self.pending_files.append(file_path)
             return True
         return False
+
+    def _load_processed_watch_files(self):
+        os.makedirs(os.path.dirname(self.processed_watch_files_path), exist_ok=True)
+        if not os.path.exists(self.processed_watch_files_path):
+            return {}
+        try:
+            with open(self.processed_watch_files_path, "r", encoding="utf-8") as f:
+                items = json.load(f)
+            processed = {}
+            for item in items if isinstance(items, list) else []:
+                path = item.get("path")
+                if path:
+                    processed[path] = item
+            return processed
+        except Exception as e:
+            logger.error(f"Failed to load processed watch files: {e}")
+            return {}
+
+    def _save_processed_watch_files(self):
+        try:
+            os.makedirs(os.path.dirname(self.processed_watch_files_path), exist_ok=True)
+            with open(self.processed_watch_files_path, "w", encoding="utf-8") as f:
+                json.dump(list(self.processed_watch_files.values()), f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save processed watch files: {e}")
+
+    def _is_already_processed_watch_file(self, file_path):
+        entry = self.processed_watch_files.get(file_path)
+        if not entry:
+            return False
+        try:
+            current_size = os.path.getsize(file_path)
+            current_mtime = os.path.getmtime(file_path)
+            return entry.get("size") == current_size and entry.get("mtime") == current_mtime
+        except Exception:
+            return False
+
+    def _mark_processed_watch_file(self, file_path):
+        try:
+            self.processed_watch_files[file_path] = {
+                "path": file_path,
+                "size": os.path.getsize(file_path),
+                "mtime": os.path.getmtime(file_path),
+                "processed_at": datetime.now().isoformat()
+            }
+            self._save_processed_watch_files()
+        except Exception as e:
+            logger.error(f"Failed to mark processed file: {e}")
 
     def _get_meetings_for_timestamp(self, dt, format_type=None):
         timezone_offset = self.config.get("timezone_offset_hours", 0)
@@ -455,6 +512,9 @@ class AutoMeetingVideoRenamer:
         # Process each file
         for video_file in sorted(video_files):
             try:
+                if self._is_already_processed_watch_file(str(video_file)):
+                    logger.info(f"Skipping already processed file: {video_file}")
+                    continue
                 logger.info(f"Processing existing file: {video_file}")
                 self.on_video_created(str(video_file))
                 # Small delay between files to avoid overwhelming the API
@@ -552,6 +612,17 @@ class AutoMeetingVideoRenamer:
             json_body={"callback_query_id": callback["id"]}
         )
 
+        # Menu actions that don't require callback_map
+        if data == "menu_recent_10":
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            self._send_recent_recordings_menu(10, chat_id=chat_id)
+            return
+
         # Look up full data from short ID
         cb_data = self.callback_map.get(data)
         if not cb_data:
@@ -632,6 +703,25 @@ class AutoMeetingVideoRenamer:
                     logger.error(f"Failed to send cancel request: {e}")
             
             self.uploader._send_telegram_notification(f"🛑 Process stopped for: {os.path.basename(file_path) if file_path else 'Unknown'}")
+
+        elif cb_data["action"] == "move_to_transcribe":
+            file_path = cb_data.get("file_path")
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            threading.Thread(target=self._move_to_transcribe_folder, args=(file_path,)).start()
+
+        elif cb_data["action"] == "recent_cancel":
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            self.uploader._send_telegram_notification("✅ Cancelled.")
 
         elif cb_data["action"] == "assign_speaker":
             job_id = cb_data["job_id"]
@@ -1022,6 +1112,24 @@ class AutoMeetingVideoRenamer:
                     self.uploader._send_telegram_notification(f"❌ Failed to update speaker for job {job_id}")
             else:
                 self.uploader._send_telegram_notification("⚠️ Invalid format. Use: `/name job_id speaker_id Real Name`")
+            return
+
+        if text.startswith("/recent"):
+            # Format: /recent [count]
+            parts = text.split(" ", 1)
+            count = 10
+            if len(parts) == 2:
+                try:
+                    count = int(parts[1].strip())
+                except ValueError:
+                    count = 10
+            count = max(1, count)
+            self._send_recent_recordings_menu(count, chat_id=chat_id)
+            return
+
+        if text.startswith("/menu") or text.startswith("/start"):
+            self._send_main_menu(chat_id)
+            return
 
     def handle_telegram_callback(self, callback_query):
         """Handle button clicks from Telegram"""
@@ -1074,20 +1182,179 @@ class AutoMeetingVideoRenamer:
             else:
                 logger.error(f"Callback data not found: {data}")
                 self.uploader._send_telegram_notification(f"❌ Error: Selection expired")
+        else:
+            # Fetch from callback_map for recent recordings
+            if data in self.callback_map:
+                cb_data = self.callback_map[data]
+                if cb_data.get("action") == "move_to_transcribe":
+                    file_path = cb_data.get("file_path")
+                    threading.Thread(target=self._move_to_transcribe_folder, args=(file_path,)).start()
+                elif cb_data.get("action") == "recent_cancel":
+                    self.uploader._send_telegram_notification("✅ Cancelled.")
+                else:
+                    logger.error(f"Unknown callback action: {cb_data.get('action')}")
+                    self.uploader._send_telegram_notification("❌ Error: Unknown action")
+            elif data:
+                logger.error(f"Callback data not found: {data}")
+                self.uploader._send_telegram_notification("❌ Error: Selection expired")
+
+    def _send_recent_recordings_menu(self, count=10, chat_id=None):
+        """Send a list of recent files from watch_folder with buttons to move to to_transcribe_folder."""
+        watch_folder = self.config.get("watch_folder")
+        extensions = set(self.config.get("video_extensions", []))
+
+        if not watch_folder or not os.path.isdir(watch_folder):
+            self.uploader._send_telegram_notification("❌ Watch folder not found.")
+            return
+
+        try:
+            entries = []
+            for name in os.listdir(watch_folder):
+                full_path = os.path.join(watch_folder, name)
+                if not os.path.isfile(full_path):
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if extensions and ext not in extensions:
+                    continue
+                try:
+                    mtime = os.path.getmtime(full_path)
+                except Exception:
+                    mtime = 0
+                entries.append((mtime, full_path))
+
+            if not entries:
+                self.uploader._send_telegram_notification("ℹ️ No recordings found in watch folder.")
+                return
+
+            entries.sort(key=lambda x: x[0], reverse=True)
+            entries = entries[:count]
+
+            keyboard = []
+            for i, (_, file_path) in enumerate(entries, start=1):
+                cb_id = f"mv_{int(time.time())}_{i}"
+                self.callback_map[cb_id] = {
+                    "action": "move_to_transcribe",
+                    "file_path": file_path,
+                }
+                keyboard.append([
+                    {"text": f"{i}. {os.path.basename(file_path)}", "callback_data": cb_id}
+                ])
+
+            cancel_id = f"mv_cancel_{int(time.time())}"
+            self.callback_map[cancel_id] = {"action": "recent_cancel"}
+            keyboard.append([
+                {"text": "❌ Cancel", "callback_data": cancel_id}
+            ])
+
+            self.callback_persistence.save(self.callback_map)
+
+            if chat_id is None:
+                self.uploader._send_telegram_notification(
+                    f"📂 Recent recordings in watch folder (last {len(entries)}).\nChoose a file to move to transcription:",
+                    reply_markup={"inline_keyboard": keyboard}
+                )
+            else:
+                token = self.config.get("telegram_bot_token")
+                if not token:
+                    return
+                request_json(
+                    "POST",
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json_body={
+                        "chat_id": chat_id,
+                        "text": f"📂 Recent recordings in watch folder (last {len(entries)}).\nChoose a file to move to transcription:",
+                        "reply_markup": {"inline_keyboard": keyboard}
+                    }
+                )
+        except Exception as e:
+            logger.error(f"Failed to list recent recordings: {e}")
+            self.uploader._send_telegram_notification("❌ Failed to list recordings.")
+
+    def _move_to_transcribe_folder(self, file_path):
+        """Move selected file from watch_folder to to_transcribe_folder to start transcription."""
+        try:
+            if not file_path or not os.path.isfile(file_path):
+                self.uploader._send_telegram_notification("❌ File not found or already moved.")
+                return
+
+            to_folder = self.config.get("to_transcribe_folder")
+            if not to_folder or not os.path.isdir(to_folder):
+                self.uploader._send_telegram_notification("❌ Transcribe folder not found.")
+                return
+
+            dest_path = self._get_unique_destination(to_folder, os.path.basename(file_path))
+            shutil.move(file_path, dest_path)
+            self.uploader._send_telegram_notification(
+                f"✅ Moved to transcription: {os.path.basename(dest_path)}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to move file to transcribe folder: {e}")
+            self.uploader._send_telegram_notification("❌ Failed to move file.")
+
+    def _send_main_menu(self, chat_id):
+        """Send a basic Telegram menu with common actions."""
+        token = self.config.get("telegram_bot_token")
+        if not token:
+            return
+
+        keyboard = [
+            [
+                {"text": "📂 Recent recordings (10)", "callback_data": "menu_recent_10"}
+            ]
+        ]
+
+        request_json(
+            "POST",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json_body={
+                "chat_id": chat_id,
+                "text": "Choose an option:",
+                "reply_markup": {"inline_keyboard": keyboard}
+            }
+        )
+
+    def _get_unique_destination(self, folder, filename):
+        """Avoid overwriting existing files by appending a suffix."""
+        base, ext = os.path.splitext(filename)
+        candidate = os.path.join(folder, filename)
+        if not os.path.exists(candidate):
+            return candidate
+
+        idx = 1
+        while True:
+            new_name = f"{base}_{idx}{ext}"
+            candidate = os.path.join(folder, new_name)
+            if not os.path.exists(candidate):
+                return candidate
+            idx += 1
 
     def handle_successful_rename(self, result, original_file_path):
         """Helper to handle the post-rename logic"""
         logger.info(f"✓ {result['message']}")
         new_path = result['new_path']
+
+        self._mark_processed_watch_file(new_path)
         
         # File is now renamed and stays in watch_folder
         # User will manually move it to to_transcribe_folder to trigger transcription
         logger.info(f"📁 File renamed and ready for transcription: {new_path}")
         logger.info(f"📝 To transcribe this file, move it to: {self.config.get('to_transcribe_folder')}")
         
+        cb_id = f"mv_{int(time.time())}_{abs(hash(new_path)) % 100000}"
+        self.callback_map[cb_id] = {
+            "action": "move_to_transcribe",
+            "file_path": new_path,
+        }
+        self.callback_persistence.save(self.callback_map)
+
         self.uploader._send_telegram_notification(
             f"✅ File renamed: {os.path.basename(new_path)}\n\n"
-            f"📝 Move it to the transcription folder to start transcription."
+            f"📝 Move it to the transcription folder to start transcription.",
+            reply_markup={
+                "inline_keyboard": [[
+                    {"text": "🚀 Start transcription", "callback_data": cb_id}
+                ]]
+            }
         )
 
     def flush_meeting_queue(self):
@@ -1246,8 +1513,9 @@ class AutoMeetingVideoRenamer:
             if trimmed_text:
                 summary_prompt = (
                     "Analyze the following meeting transcript.\n"
-                    "1. Write a concise summary (1-2 sentences) in that SAME language.\n"
-                    "2. Provide a bulleted list of specific key discussion topics (Key Discussion Topics).\n"
+                    "1. Write a concise summary (1-2 sentences) strictly in the SAME language as the transcript.\n"
+                    "2. Provide a bulleted list of specific key discussion topics in the SAME language as the transcript.\n"
+                    "Do not use English if the transcript is in another language. "
                     "Ensure the output is neatly formatted for a spreadsheet cell.\n\n"
                     f"Transcript:\n{trimmed_text}"
                 )

@@ -264,6 +264,7 @@ class VideoUploader:
                 # Clean and merge segments before processing
                 logger.info(f"Cleaning transcript segments for job {job_id}")
                 transcript_data = self._clean_transcript_data(transcript_data)
+                enable_speaker_identification = self.config.get("enable_speaker_identification", True)
                 
                 if not finalize:
                     # Check if manual renaming has already occurred
@@ -275,13 +276,15 @@ class VideoUploader:
                     
                     if not has_manual_renames:
                         # Identify speakers using OpenRouter (if enabled)
-                        enable_speaker_identification = self.config.get("enable_speaker_identification", True)
                         if enable_speaker_identification:
                             logger.info(f"Starting speaker identification for job {job_id}")
                             identified_speakers = self._identify_speakers(transcript_data, job_id)
                         else:
                             logger.info(f"Speaker identification disabled for job {job_id}")
                             identified_speakers = None
+
+                            # Still send transcript file to Telegram when speaker identification is disabled
+                            self._send_formatted_transcript_to_telegram(transcript_data)
                         
                         if identified_speakers:
                             logger.info(f"Speakers identified: {identified_speakers}")
@@ -344,7 +347,7 @@ class VideoUploader:
                     meeting_info = self.meeting_info_by_job.pop(job_id, None)
                     # If finalize=False but we are skipping interaction (e.g. no Telegram token), we must treat it as final.
                     is_final_call = finalize
-                    if not finalize and not self.config.get("telegram_bot_token"):
+                    if not finalize and (not self.config.get("telegram_bot_token") or not enable_speaker_identification):
                         is_final_call = True
                         
                     self.main_app.on_transcript_ready(
@@ -467,6 +470,53 @@ class VideoUploader:
             return f"[{minutes:02d}:{remaining_seconds:02d}]"
         except (ValueError, TypeError):
             return "[00:00]"
+
+    def _send_formatted_transcript_to_telegram(self, transcript_data):
+        """Send a formatted transcript file to Telegram without running speaker identification."""
+        try:
+            segments = self._find_segments(transcript_data) or []
+            if not segments:
+                return
+
+            formatted_lines = []
+            current_speaker = None
+            current_start_time = 0.0
+            current_buffer = []
+
+            for segment in segments:
+                speaker_id, text, start, _ = self._get_segment_fields(segment)
+                if not text:
+                    continue
+
+                if current_speaker is not None and speaker_id != current_speaker:
+                    time_str = self._format_timestamp(current_start_time)
+                    formatted_lines.append(f"{time_str} {current_speaker}: {' '.join(current_buffer)}")
+                    current_buffer = []
+                    current_start_time = start
+
+                if current_speaker is None:
+                    current_start_time = start
+
+                current_speaker = speaker_id
+                current_buffer.append(text)
+
+            if current_speaker and current_buffer:
+                time_str = self._format_timestamp(current_start_time)
+                formatted_lines.append(f"{time_str} {current_speaker}: {' '.join(current_buffer)}")
+
+            full_transcript_text = "\n\n".join(formatted_lines)
+
+            token = self.config.get("telegram_bot_token")
+            chat_id = self.config.get("telegram_chat_id")
+            if token and chat_id and full_transcript_text:
+                file_name = f"transcript_{os.path.basename(transcript_data.get('title', 'meeting'))}.txt"
+                url = f"https://api.telegram.org/bot{token}/sendDocument"
+                files = {'document': (file_name, full_transcript_text.encode('utf-8'))}
+                data = {'chat_id': chat_id, 'caption': f"📄 Transcript for: {os.path.basename(transcript_data.get('title', 'Unknown'))}"}
+                request_text("POST", url, data=data, files=files, timeout=15)
+                logger.info("Sent formatted transcript to Telegram (speaker identification disabled)")
+        except Exception as e:
+            logger.error(f"Failed to send transcript to Telegram: {e}")
 
     def _identify_speakers(self, transcript_data, job_id=None):
         api_key = self.config.get("openrouter_api_key")
