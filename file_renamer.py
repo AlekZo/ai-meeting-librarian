@@ -42,6 +42,23 @@ class FileRenamer:
         return sanitized
     
     @staticmethod
+    def extract_original_timestamp_string(filename):
+        """
+        Extract the ORIGINAL timestamp string from filename, preserving its format.
+        
+        Args:
+            filename: Filename to extract timestamp from
+        
+        Returns:
+            str: Original timestamp string as it appears in filename, or None if not found
+        """
+        match = re.search(TIMESTAMP_PATTERN, filename)
+        if match:
+            # Return the matched string exactly as it appears in the filename
+            return match.group(0)
+        return None
+
+    @staticmethod
     def extract_timestamp_from_filename(filename):
         """
         Extract timestamp from filename pattern like:
@@ -54,7 +71,7 @@ class FileRenamer:
             filename: Filename to extract timestamp from
         
         Returns:
-            tuple: (datetime object, timestamp_string) or (None, None) if not found
+            tuple: (datetime object, timestamp_string, format_type) or (None, None, None) if not found
         """
         match = re.search(TIMESTAMP_PATTERN, filename)
         if match:
@@ -105,6 +122,36 @@ class FileRenamer:
         file_path = Path(original_file_path)
         sanitized_title = FileRenamer.sanitize_filename(meeting_title)
         return FileRenamer._build_unique_filename(file_path, f"{sanitized_title}_{timestamp_str}")
+
+    @staticmethod
+    def generate_new_filename_preserve_timestamp_format(meeting_title, original_file_path, dry_run=False):
+        """
+        Generate new filename based on meeting title while preserving the ORIGINAL timestamp format.
+        This extracts the timestamp exactly as it appears in the original filename.
+        
+        Args:
+            meeting_title: Title of the meeting
+            original_file_path: Path to the original file
+            dry_run: If True, don't actually rename the file
+        
+        Returns:
+            str: New filename with full path, or None if timestamp cannot be extracted
+        """
+        if not meeting_title:
+            logger.warning("No meeting title provided, keeping original filename")
+            return original_file_path
+        
+        filename = os.path.basename(original_file_path)
+        original_timestamp = FileRenamer.extract_original_timestamp_string(filename)
+        
+        if not original_timestamp:
+            logger.warning(f"Could not extract original timestamp from {filename}, using standard format")
+            return FileRenamer.generate_new_filename(meeting_title, original_file_path, dry_run)
+        
+        file_path = Path(original_file_path)
+        sanitized_title = FileRenamer.sanitize_filename(meeting_title)
+        logger.info(f"Preserving original timestamp format: {original_timestamp}")
+        return FileRenamer._build_unique_filename(file_path, f"{sanitized_title}_{original_timestamp}")
     
     @staticmethod
     def generate_new_filename(meeting_title, original_file_path, dry_run=False):

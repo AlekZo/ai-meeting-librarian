@@ -270,9 +270,22 @@ class AutoMeetingVideoRenamer:
 
         filename = os.path.basename(file_path)
         
+        # Extract language if present (e.g., "Title_YYYY-MM-DD_HH-MM-SS_lang_ru.mp4")
+        language = None
+        if "_lang_" in filename:
+            try:
+                parts = filename.split("_lang_")
+                lang_part = parts[1].split(".")[0]
+                language = lang_part
+                # Clean filename for further processing
+                filename_clean = parts[0] + "." + filename.split(".")[-1]
+            except:
+                filename_clean = filename
+        else:
+            filename_clean = filename
+
         # Extract meeting info from filename
-        # Expected format: "Meeting Title_YYYY-MM-DD_HH-MM-SS.mp4"
-        dt, timestamp_str, format_type = FileRenamer.extract_timestamp_from_filename(filename)
+        dt, timestamp_str, format_type = FileRenamer.extract_timestamp_from_filename(filename_clean)
         
         if not dt or not timestamp_str:
             logger.warning(f"Could not extract timestamp from filename: {filename}")
@@ -283,25 +296,25 @@ class AutoMeetingVideoRenamer:
             return
 
         # Extract meeting title from filename (everything before the timestamp)
-        # Format: "Title_YYYY-MM-DD_HH-MM-SS.mp4"
-        parts = filename.split(f"_{timestamp_str}")
+        parts = filename_clean.split(f"_{timestamp_str}")
         if len(parts) > 0:
             meeting_title = parts[0].replace("_", " ")
         else:
             meeting_title = "Unknown Meeting"
 
-        logger.info(f"Extracted meeting info - Title: {meeting_title}, Time: {dt}")
+        logger.info(f"Extracted meeting info - Title: {meeting_title}, Time: {dt}, Lang: {language}")
         
         # Upload to transcription service
         meeting_info = {
             "meeting_name": meeting_title,
             "meeting_time": dt.isoformat() if dt else datetime.now().isoformat(),
             "video_source_link": f"file:///{file_path}",
+            "language": language
         }
         
         logger.info(f"Uploading file to transcription service: {file_path}")
         self.uploader._send_telegram_notification(
-            f"📤 Starting transcription for: {meeting_title}"
+            f"📤 Starting transcription for: {meeting_title} ({language.upper() if language else 'AUTO'})"
         )
         
         self.uploader.upload_video(file_path, meeting_info=meeting_info)
@@ -407,13 +420,17 @@ class AutoMeetingVideoRenamer:
             self.callback_map[cb_id] = {"action": "retry", "file_path": file_path}
             cancel_id = f"skip_{int(time.time())}"
             self.callback_map[cancel_id] = {"action": "skip", "file_path": file_path}
+            manual_id = f"manual_{int(time.time())}"
+            self.callback_map[manual_id] = {"action": "manual_rename", "file_path": file_path}
             self.callback_persistence.save(self.callback_map)
 
             self.uploader._send_telegram_notification(
-                f"❓ No meeting found for: {filename}\n\nPlease add it to Google Calendar and click Retry.",
+                f"❓ No meeting found for: {filename}\n\nPlease add it to Google Calendar and click Retry, or enter a custom name.",
                 reply_markup={
                     "inline_keyboard": [[
                         {"text": "🔄 Retry", "callback_data": cb_id},
+                        {"text": "✏️ Manual Name", "callback_data": manual_id}
+                    ], [
                         {"text": "❌ Cancel", "callback_data": cancel_id}
                     ]]
                 }
@@ -455,7 +472,16 @@ class AutoMeetingVideoRenamer:
 
         cancel_id = f"skip_{int(time.time())}"
         self.callback_map[cancel_id] = {"action": "skip", "file_path": file_path}
+        
+        keep_id = f"keep_{int(time.time())}"
+        self.callback_map[keep_id] = {"action": "keep_name", "file_path": file_path}
+        
+        manual_id = f"manual_{int(time.time())}"
+        self.callback_map[manual_id] = {"action": "manual_rename", "file_path": file_path}
         self.callback_persistence.save(self.callback_map)
+        
+        buttons.append([{"text": "💾 Keep Current Name", "callback_data": keep_id}])
+        buttons.append([{"text": "✏️ Manual Name", "callback_data": manual_id}])
         buttons.append([{"text": "❌ Cancel", "callback_data": cancel_id}])
 
         self.uploader._send_telegram_notification(
@@ -665,6 +691,30 @@ class AutoMeetingVideoRenamer:
             
             threading.Thread(target=self.on_video_created, args=(file_path,)).start()
 
+        elif cb_data["action"] == "keep_name":
+            file_path = cb_data.get("file_path")
+            logger.info(f"User chose to keep current name for: {file_path}")
+            
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+
+            if file_path and os.path.exists(file_path):
+                result = {
+                    'success': True,
+                    'new_path': file_path,
+                    'meeting_title': os.path.splitext(os.path.basename(file_path))[0],
+                    'meeting_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'message': f"Kept current name: {os.path.basename(file_path)}"
+                }
+                self.handle_successful_rename(result, file_path)
+                self.uploader._send_telegram_notification(f"✅ Kept current name: {os.path.basename(file_path)}")
+            else:
+                self.uploader._send_telegram_notification("❌ File not found.")
+
         elif cb_data["action"] == "skip":
             file_path = cb_data.get("file_path")
             logger.info(f"User canceled meeting selection for: {file_path}")
@@ -706,13 +756,44 @@ class AutoMeetingVideoRenamer:
 
         elif cb_data["action"] == "move_to_transcribe":
             file_path = cb_data.get("file_path")
+            language = cb_data.get("language")
             # Remove buttons
             request_json(
                 "POST",
                 f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
                 json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
             )
-            threading.Thread(target=self._move_to_transcribe_folder, args=(file_path,)).start()
+            threading.Thread(target=self._move_to_transcribe_folder, args=(file_path, language)).start()
+
+        elif cb_data["action"] == "skip_transcribe":
+            file_path = cb_data.get("file_path")
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            self.uploader._send_telegram_notification(f"⏭️ Skipped transcription for: {os.path.basename(file_path)}")
+
+        elif cb_data["action"] == "manual_rename":
+            file_path = cb_data.get("file_path")
+            # Set state for user to provide manual meeting name
+            self.user_states[chat_id] = {
+                "state": "awaiting_meeting_name",
+                "file_path": file_path
+            }
+            
+            # Remove buttons and ask for new meeting name
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            
+            self.uploader._send_telegram_notification(
+                f"What should the meeting name be for: {os.path.basename(file_path)}?",
+                reply_markup={"force_reply": True, "selective": True}
+            )
 
         elif cb_data["action"] == "recent_cancel":
             # Remove buttons
@@ -909,8 +990,10 @@ class AutoMeetingVideoRenamer:
             self.handle_successful_rename(result, file_path)
 
     def monitor_internet_connection(self):
-        """Monitor internet connection and handle reconnection"""
+        """Monitor internet connection and handle reconnection, and check health of monitors"""
         check_interval = 30  # Check every 30 seconds
+        last_health_check = 0
+        health_check_interval = 300 # Check monitor health every 5 minutes
         
         while self.running:
             try:
@@ -935,11 +1018,37 @@ class AutoMeetingVideoRenamer:
                     self.internet_available = False
                     self.tray.update_status("Offline (Queuing)", "orange")
                 
+                # Health check for monitors (important after system sleep)
+                now = time.time()
+                if now - last_health_check > health_check_interval:
+                    self._check_monitors_health()
+                    last_health_check = now
+
                 time.sleep(check_interval)
             
             except Exception as e:
                 logger.error(f"Error monitoring internet connection: {e}")
                 time.sleep(check_interval)
+
+    def _check_monitors_health(self):
+        """Check if file monitors are still alive and restart if necessary"""
+        if self.monitor and not self.monitor.is_alive():
+            logger.warning("Watch folder monitor died. Restarting...")
+            try:
+                self.monitor.stop()
+                self.monitor.start()
+                logger.info("✓ Watch folder monitor restarted")
+            except Exception as e:
+                logger.error(f"Failed to restart watch folder monitor: {e}")
+
+        if self.transcribe_monitor and not self.transcribe_monitor.is_alive():
+            logger.warning("Transcribe folder monitor died. Restarting...")
+            try:
+                self.transcribe_monitor.stop()
+                self.transcribe_monitor.start()
+                logger.info("✓ Transcribe folder monitor restarted")
+            except Exception as e:
+                logger.error(f"Failed to restart transcribe folder monitor: {e}")
     
     def run(self):
         """Run the application"""
@@ -1052,6 +1161,41 @@ class AutoMeetingVideoRenamer:
         
         # Check if user is in a state
         user_state = self.user_states.get(chat_id)
+        if user_state and user_state["state"] == "awaiting_meeting_name":
+            file_path = user_state["file_path"]
+            new_meeting_name = text.strip()
+            
+            logger.info(f"User provided manual meeting name: {new_meeting_name} for {file_path}")
+            
+            # Clear state
+            del self.user_states[chat_id]
+            
+            # Rename file with new meeting name, preserving original timestamp format
+            dry_run = self.config.get("dry_run", False)
+            new_path = FileRenamer.generate_new_filename_preserve_timestamp_format(
+                new_meeting_name, file_path, dry_run
+            )
+            
+            if not new_path:
+                filename = os.path.basename(file_path)
+                self.uploader._send_telegram_notification(f"❌ Could not extract timestamp from filename: {filename}")
+                return
+            
+            if FileRenamer.rename_file(file_path, new_path, dry_run):
+                result = {
+                    'success': True,
+                    'new_path': new_path,
+                    'meeting_title': new_meeting_name,
+                    'meeting_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'message': f"Successfully renamed to {os.path.basename(new_path)}"
+                }
+                self.handle_successful_rename(result, file_path)
+            else:
+                logger.error(f"Failed to rename file: {file_path}")
+                filename = os.path.basename(file_path)
+                self.uploader._send_telegram_notification(f"❌ Failed to rename file: {filename}")
+            return
+        
         if user_state and user_state["state"] == "awaiting_name":
             job_id = user_state["job_id"]
             speaker_id = user_state["speaker_id"]
@@ -1270,7 +1414,7 @@ class AutoMeetingVideoRenamer:
             logger.error(f"Failed to list recent recordings: {e}")
             self.uploader._send_telegram_notification("❌ Failed to list recordings.")
 
-    def _move_to_transcribe_folder(self, file_path):
+    def _move_to_transcribe_folder(self, file_path, language=None):
         """Move selected file from watch_folder to to_transcribe_folder to start transcription."""
         try:
             if not file_path or not os.path.isfile(file_path):
@@ -1282,10 +1426,16 @@ class AutoMeetingVideoRenamer:
                 self.uploader._send_telegram_notification("❌ Transcribe folder not found.")
                 return
 
-            dest_path = self._get_unique_destination(to_folder, os.path.basename(file_path))
+            filename = os.path.basename(file_path)
+            if language:
+                # Append language tag to filename so on_video_for_transcription can pick it up
+                name, ext = os.path.splitext(filename)
+                filename = f"{name}_lang_{language}{ext}"
+
+            dest_path = self._get_unique_destination(to_folder, filename)
             shutil.move(file_path, dest_path)
             self.uploader._send_telegram_notification(
-                f"✅ Moved to transcription: {os.path.basename(dest_path)}"
+                f"✅ Moved to transcription ({language.upper() if language else 'AUTO'}): {os.path.basename(dest_path)}"
             )
         except Exception as e:
             logger.error(f"Failed to move file to transcribe folder: {e}")
@@ -1335,24 +1485,63 @@ class AutoMeetingVideoRenamer:
 
         self._mark_processed_watch_file(new_path)
         
-        # File is now renamed and stays in watch_folder
-        # User will manually move it to to_transcribe_folder to trigger transcription
-        logger.info(f"📁 File renamed and ready for transcription: {new_path}")
-        logger.info(f"📝 To transcribe this file, move it to: {self.config.get('to_transcribe_folder')}")
+        # Move file to renamed_folder
+        renamed_folder = self.config.get("renamed_folder")
+        if renamed_folder:
+            try:
+                os.makedirs(renamed_folder, exist_ok=True)
+                filename = os.path.basename(new_path)
+                renamed_path = os.path.join(renamed_folder, filename)
+                
+                # Move file from watch_folder to renamed_folder
+                if os.path.exists(new_path):
+                    shutil.move(new_path, renamed_path)
+                    logger.info(f"✓ File moved to renamed folder: {renamed_path}")
+                    new_path = renamed_path
+                else:
+                    logger.warning(f"File not found at {new_path}, skipping move to renamed folder")
+            except Exception as e:
+                logger.error(f"Failed to move file to renamed folder: {e}")
         
-        cb_id = f"mv_{int(time.time())}_{abs(hash(new_path)) % 100000}"
-        self.callback_map[cb_id] = {
+        # Ask user if they want to proceed with transcription
+        logger.info(f"📁 File renamed and ready for transcription: {new_path}")
+        
+        cb_id_ru = f"tr_ru_{int(time.time())}"
+        cb_id_en = f"tr_en_{int(time.time())}"
+        cb_id_no = f"tr_no_{int(time.time())}"
+        cb_id_rename = f"tr_rename_{int(time.time())}"
+        
+        self.callback_map[cb_id_ru] = {
             "action": "move_to_transcribe",
+            "file_path": new_path,
+            "language": "ru"
+        }
+        self.callback_map[cb_id_en] = {
+            "action": "move_to_transcribe",
+            "file_path": new_path,
+            "language": "en"
+        }
+        self.callback_map[cb_id_no] = {
+            "action": "skip_transcribe",
+            "file_path": new_path,
+        }
+        self.callback_map[cb_id_rename] = {
+            "action": "manual_rename",
             "file_path": new_path,
         }
         self.callback_persistence.save(self.callback_map)
 
         self.uploader._send_telegram_notification(
             f"✅ File renamed: {os.path.basename(new_path)}\n\n"
-            f"📝 Move it to the transcription folder to start transcription.",
+            f"Meeting: {result.get('meeting_title', 'Unknown')}\n\n"
+            f"Would you like to proceed with transcription?",
             reply_markup={
                 "inline_keyboard": [[
-                    {"text": "🚀 Start transcription", "callback_data": cb_id}
+                    {"text": "🇷🇺 Transcribe RU", "callback_data": cb_id_ru},
+                    {"text": "🇺🇸 Transcribe ENG", "callback_data": cb_id_en}
+                ], [
+                    {"text": "⏭️ Skip", "callback_data": cb_id_no},
+                    {"text": "✏️ Change Name", "callback_data": cb_id_rename}
                 ]]
             }
         )

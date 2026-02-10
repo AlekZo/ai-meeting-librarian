@@ -17,6 +17,7 @@
     "openrouter_api_key": "YOUR_OPENROUTER_KEY_HERE",
     "openrouter_max_tokens": 80000,
     "openrouter_model": "google/gemini-2.0-flash-001",
+    "renamed_folder": "C:/Path/To/Renamed",
     "to_transcribe_folder": "C:/Path/To/ToTranscribe",
     "transcribed_folder": "C:/Path/To/Transcribed",
     "telegram_bot_token": "YOUR_TELEGRAM_TOKEN_HERE",

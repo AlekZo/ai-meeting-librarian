@@ -276,6 +276,24 @@ class GoogleCalendarHandler:
         meetings = self.get_meetings_at_time(check_time, retry_attempts, retry_delay)
         return meetings[0] if meetings else None
 
+    def _ensure_authenticated(self):
+        """Ensure credentials are valid and refresh if necessary"""
+        if not self.creds or not self.creds.valid:
+            if self.creds and self.creds.expired and self.creds.refresh_token:
+                logger.info("Refreshing expired credentials automatically")
+                try:
+                    self.creds.refresh(Request())
+                    with open(self.token_file, 'w') as token:
+                        token.write(self.creds.to_json())
+                except Exception as e:
+                    logger.error(f"Failed to refresh token: {e}")
+                    self.authenticate()
+            else:
+                self.authenticate()
+        
+        if not self.service:
+            self.service = build('calendar', 'v3', credentials=self.creds)
+
     def get_all_meetings_on_date(self, check_date, retry_attempts=3, retry_delay=2):
         """
         Get all meetings on a specific date (regardless of time overlap)
@@ -288,8 +306,7 @@ class GoogleCalendarHandler:
         Returns:
             list: List of all meeting events on that date or empty list if none found
         """
-        if not self.service:
-            self.authenticate()
+        self._ensure_authenticated()
         
         for attempt in range(retry_attempts):
             try:
@@ -321,6 +338,13 @@ class GoogleCalendarHandler:
             
             except HttpError as e:
                 error_code = e.resp.status
+                if error_code == 403 and "insufficient authentication scopes" in str(e).lower():
+                    logger.warning("Insufficient permissions detected. Deleting token and re-authenticating...")
+                    if os.path.exists(self.token_file):
+                        os.remove(self.token_file)
+                    self.authenticate()
+                    return self.get_all_meetings_on_date(check_date, retry_attempts, retry_delay)
+                
                 if error_code in [403, 429, 500, 502, 503, 504]:
                     if attempt < retry_attempts - 1:
                         logger.warning(f"Google Calendar API error (attempt {attempt + 1}/{retry_attempts}): {e.resp.reason}. Retrying in {retry_delay}s...")

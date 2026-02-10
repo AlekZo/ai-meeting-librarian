@@ -1,5 +1,6 @@
 """
 Google Sheets and Drive integration helpers
+Supports queuing Sheets operations for batch processing
 """
 
 from __future__ import annotations
@@ -7,7 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Optional, Dict
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -24,12 +25,13 @@ SCOPES = [
 
 
 class SheetsDriveHandler:
-    def __init__(self, credentials_file: str, token_file: str):
+    def __init__(self, credentials_file: str, token_file: str, sheets_queue: Optional[Any] = None):
         self.credentials_file = credentials_file
         self.token_file = token_file
         self.creds = None
         self.sheets_service = None
         self.drive_service = None
+        self.sheets_queue = sheets_queue  # Optional SheetsQueue instance
 
     def authenticate(self, retry_attempts: int = 3, retry_delay: int = 5) -> None:
         self.creds = None
@@ -78,19 +80,76 @@ class SheetsDriveHandler:
                     raise
 
     def _ensure_services(self) -> None:
-        if not self.sheets_service or not self.drive_service:
-            self.authenticate()
+        if not self.creds or not self.creds.valid:
+            if self.creds and self.creds.expired and self.creds.refresh_token:
+                logger.info("Refreshing expired credentials for Sheets/Drive automatically")
+                try:
+                    self.creds.refresh(Request())
+                    with open(self.token_file, "w") as token:
+                        token.write(self.creds.to_json())
+                except Exception as e:
+                    logger.error(f"Failed to refresh Sheets/Drive token: {e}")
+                    self.authenticate()
+            else:
+                self.authenticate()
 
-    def append_meeting_log(self, spreadsheet_id: str, sheet_name: str, row: List[Any]) -> None:
-        self._ensure_services()
-        body = {"values": [row]}
-        self.sheets_service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range=sheet_name,
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body=body,
-        ).execute()
+        if not self.sheets_service or not self.drive_service:
+            self.sheets_service = build("sheets", "v4", credentials=self.creds)
+            self.drive_service = build("drive", "v3", credentials=self.creds)
+
+    def append_meeting_log(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        row: List[Any],
+        queue_if_failed: bool = True,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Append a meeting log row to Google Sheets
+        
+        Args:
+            spreadsheet_id: Google Sheets ID
+            sheet_name: Sheet name/tab
+            row: Row data to append
+            queue_if_failed: Queue the operation if it fails
+            metadata: Optional metadata for queuing
+            
+        Returns:
+            True if successful, False if queued or failed
+        """
+        try:
+            self._ensure_services()
+            body = {"values": [row]}
+            self.sheets_service.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range=sheet_name,
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body=body,
+            ).execute()
+            logger.info(f"Successfully appended meeting log to {sheet_name}")
+            return True
+        except Exception as e:
+            if "insufficient authentication scopes" in str(e).lower() or (hasattr(e, 'resp') and e.resp.status == 403):
+                logger.warning("Insufficient permissions for Sheets/Drive. Deleting token and re-authenticating...")
+                if os.path.exists(self.token_file):
+                    os.remove(self.token_file)
+                self.authenticate()
+                # Retry the operation once
+                return self.append_meeting_log(spreadsheet_id, sheet_name, row, queue_if_failed, metadata)
+
+            logger.error(f"Failed to append meeting log: {e}")
+            if queue_if_failed and self.sheets_queue:
+                self.sheets_queue.enqueue_append(
+                    spreadsheet_id,
+                    sheet_name,
+                    row,
+                    metadata=metadata
+                )
+                logger.info("Meeting log queued for later publishing")
+                return False
+            raise
 
     def read_project_config(self, spreadsheet_id: str, sheet_name: str) -> List[Tuple[str, str]]:
         self._ensure_services()

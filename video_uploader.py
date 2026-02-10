@@ -24,6 +24,8 @@ class VideoUploader:
         logger.info("Video uploader queue worker started")
 
         self.meeting_info_by_job = {}
+        self.transcription_lock = threading.Lock()
+        self.is_transcribing = False
 
     def _worker(self):
         """Background worker to process uploads one by one"""
@@ -39,6 +41,12 @@ class VideoUploader:
                     file_path, meeting_info = item, None
 
                 logger.info(f"Queue processing: {file_path}")
+                
+                # Wait if another transcription is already in progress
+                while self.is_transcribing:
+                    logger.debug("Another transcription in progress, waiting...")
+                    time.sleep(10)
+                
                 self._process_upload(file_path, meeting_info)
                 self.upload_queue.task_done()
                 # Small delay between uploads
@@ -133,25 +141,30 @@ class VideoUploader:
             return False
 
     def start_transcription(self, job_id, original_file_path):
-        # ...existing code...
         url = f"{self.base_url}/api/v1/transcription/{job_id}/start"
         headers = {
             "X-API-Key": self.api_key,
             "Content-Type": "application/json"
         }
         
+        # Get language from meeting info if available
+        language = None
+        if job_id in self.meeting_info_by_job:
+            language = self.meeting_info_by_job[job_id].get("language")
+        
         payload = {
             "model_family": "whisper",
-            "model": "medium",
+            "model": "large-v3",
             "model_cache_only": False,
             "device": "cuda",
             "device_index": 0,
-            "batch_size": 4,
-            "compute_type": "float32",
+            "batch_size": 12,
+            "compute_type": "float16",
             "threads": 0,
             "output_format": "all",
             "verbose": True,
             "task": "transcribe",
+            "language": language,
             "interpolate_method": "nearest",
             "no_align": False,
             "return_char_alignments": False,
@@ -194,6 +207,7 @@ class VideoUploader:
             
             if response.status_code == 200:
                 logger.info(f"Successfully started transcription for job {job_id}")
+                self.is_transcribing = True
                 cb_id = f"cancel_{int(time.time())}"
                 if hasattr(self, 'main_app'):
                     self.main_app.callback_map[cb_id] = {"action": "cancel", "job_id": job_id, "file_path": original_file_path}
@@ -231,6 +245,7 @@ class VideoUploader:
                     
                     if status == "completed":
                         logger.info(f"✅ Transcription completed for job {job_id}")
+                        self.is_transcribing = False
                         scriberr_link = f"{self.base_url}/audio/{job_id}"
                         self._send_telegram_notification(
                             f"✅ Transcription completed: {os.path.basename(original_file_path)}\n🔗 View on Scriberr: {scriberr_link}"
@@ -239,6 +254,7 @@ class VideoUploader:
                         break
                     elif status == "failed":
                         logger.error(f"❌ Transcription failed for job {job_id}")
+                        self.is_transcribing = False
                         self._send_telegram_notification(f"❌ Transcription failed: {os.path.basename(original_file_path)}")
                         self._append_to_log(original_file_path, "TRANSCRIPTION_FAILED", 200, data)
                         break
