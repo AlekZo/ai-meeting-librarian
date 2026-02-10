@@ -140,7 +140,7 @@ class VideoUploader:
             logger.error(f"Error moving file to output folder: {e}")
             return False
 
-    def start_transcription(self, job_id, original_file_path):
+    def start_transcription(self, job_id, original_file_path, retry_on_cpu=False):
         url = f"{self.base_url}/api/v1/transcription/{job_id}/start"
         headers = {
             "X-API-Key": self.api_key,
@@ -152,15 +152,28 @@ class VideoUploader:
         if job_id in self.meeting_info_by_job:
             language = self.meeting_info_by_job[job_id].get("language")
         
+        device = "cpu" if retry_on_cpu else "cuda"
+        compute_type = "int8" if retry_on_cpu else "float16"
+        batch_size = 1 if retry_on_cpu else 8  # Reduced from 12 to 8 for 8GB VRAM stability
+
+        # Store start time and params for the notification
+        if not hasattr(self, 'job_stats'):
+            self.job_stats = {}
+        self.job_stats[job_id] = {
+            "start_time": time.time(),
+            "device": device,
+            "params": f"bs={batch_size}, {compute_type}"
+        }
+
         payload = {
             "model_family": "whisper",
             "model": "large-v3",
             "model_cache_only": False,
-            "device": "cuda",
+            "device": device,
             "device_index": 0,
-            "batch_size": 12,
-            "compute_type": "float16",
-            "threads": 0,
+            "batch_size": batch_size,
+            "compute_type": compute_type,
+            "threads": 14,  # Optimized for your 14-core CPU
             "output_format": "all",
             "verbose": True,
             "task": "transcribe",
@@ -182,7 +195,7 @@ class VideoUploader:
             "length_penalty": 1,
             "suppress_numerals": False,
             "condition_on_previous_text": False,
-            "fp16": True,
+            "fp16": not retry_on_cpu,
             "temperature_increment_on_fallback": 0.2,
             "compression_ratio_threshold": 2.4,
             "logprob_threshold": -1,
@@ -206,7 +219,7 @@ class VideoUploader:
             self._append_to_log(original_file_path, "TRANSCRIPTION_START", response.status_code, response_data)
             
             if response.status_code == 200:
-                logger.info(f"Successfully started transcription for job {job_id}")
+                logger.info(f"Successfully started transcription for job {job_id} on {device}")
                 self.is_transcribing = True
                 cb_id = f"cancel_{int(time.time())}"
                 if hasattr(self, 'main_app'):
@@ -214,7 +227,7 @@ class VideoUploader:
                     self.main_app.callback_persistence.save(self.main_app.callback_map)
                 
                 self._send_telegram_notification(
-                    f"🎙️ Transcription started: {os.path.basename(original_file_path)}",
+                    f"🎙️ Transcription started ({device}): {os.path.basename(original_file_path)}",
                     reply_markup={"inline_keyboard": [[{"text": "🛑 Stop Transcription", "callback_data": cb_id}]]}
                 )
                 threading.Thread(target=self._poll_status, args=(job_id, original_file_path), daemon=True).start()
@@ -247,14 +260,39 @@ class VideoUploader:
                         logger.info(f"✅ Transcription completed for job {job_id}")
                         self.is_transcribing = False
                         scriberr_link = f"{self.base_url}/audio/{job_id}"
+                        
+                        # Calculate duration and get stats
+                        stats_text = ""
+                        if hasattr(self, 'job_stats') and job_id in self.job_stats:
+                            stats = self.job_stats[job_id]
+                            duration = int(time.time() - stats["start_time"])
+                            m, s = divmod(duration, 60)
+                            time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
+                            stats_text = f"\n⚙️ {stats['device'].upper()} | {stats['params']} | ⏱️ {time_str}"
+                            del self.job_stats[job_id]
+
                         self._send_telegram_notification(
-                            f"✅ Transcription completed: {os.path.basename(original_file_path)}\n🔗 View on Scriberr: {scriberr_link}"
+                            f"✅ Transcription completed: {os.path.basename(original_file_path)}{stats_text}\n🔗 View on Scriberr: {scriberr_link}"
                         )
                         self._download_transcript(job_id, original_file_path)
                         break
                     elif status == "failed":
                         logger.error(f"❌ Transcription failed for job {job_id}")
                         self.is_transcribing = False
+                        
+                        # Check if it was a CUDA OOM error
+                        error_msg = ""
+                        if isinstance(data, dict) and "error" in data:
+                            error_msg = str(data.get("error", ""))
+                        
+                        if "CUDA failed with error out of memory" in error_msg or "out of memory" in error_msg.lower():
+                            logger.warning(f"Detected OOM for job {job_id}. Retrying on CPU...")
+                            self._send_telegram_notification(f"⚠️ GPU OOM detected for {os.path.basename(original_file_path)}. Retrying on CPU...")
+                            # Small delay before retry
+                            time.sleep(5)
+                            self.start_transcription(job_id, original_file_path, retry_on_cpu=True)
+                            break
+                        
                         self._send_telegram_notification(f"❌ Transcription failed: {os.path.basename(original_file_path)}")
                         self._append_to_log(original_file_path, "TRANSCRIPTION_FAILED", 200, data)
                         break
