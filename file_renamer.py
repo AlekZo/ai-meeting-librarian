@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 # - 2026-01-22 (date only)
 # - 2026-01-23T10:01:46Z (ISO 8601 format with timezone)
 # - 2026-01-23T10:01:46 (ISO 8601 format without timezone)
+# - 2602061401 (YYMMDDHHMM format)
 TIMESTAMP_PATTERN = r'(\d{4})-(\d{2})-(\d{2})(?:[T_](\d{2}):(\d{2}):(\d{2})|_(\d{2})-(\d{2})-(\d{2}))?'
+SHORT_TIMESTAMP_PATTERN = r'(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})'
 
 class FileRenamer:
     """Handles file renaming logic"""
@@ -56,6 +58,12 @@ class FileRenamer:
         if match:
             # Return the matched string exactly as it appears in the filename
             return match.group(0)
+        
+        # Try short pattern
+        match_short = re.search(SHORT_TIMESTAMP_PATTERN, filename)
+        if match_short:
+            return match_short.group(0)
+            
         return None
 
     @staticmethod
@@ -66,6 +74,7 @@ class FileRenamer:
         - 2026-01-22_DION Video.mp4 (date only)
         - Ердакова Надежда_2026-01-23T10:01:46Z.mp4 (ISO 8601 with timezone)
         - Ердакова Надежда_2026-01-23T10:01:46.mp4 (ISO 8601 without timezone)
+        - Кирилл Хаустов ПСБ-2602061401.mp3 (YYMMDDHHMM)
         
         Args:
             filename: Filename to extract timestamp from
@@ -99,6 +108,26 @@ class FileRenamer:
             except ValueError as e:
                 logger.warning(f"Invalid timestamp in filename: {e}")
                 return None, None, None
+
+        # Try short pattern (YYMMDDHHMM)
+        match_short = re.search(SHORT_TIMESTAMP_PATTERN, filename)
+        if match_short:
+            groups = match_short.groups()
+            try:
+                # Assume 20xx for the year
+                year = 2000 + int(groups[0])
+                month, day = int(groups[1]), int(groups[2])
+                hour, minute = int(groups[3]), int(groups[4])
+                second = 0
+                
+                dt = datetime(year, month, day, hour, minute, second)
+                timestamp_str = f"{year:04d}-{month:02d}-{day:02d}_{hour:02d}-{minute:02d}-{second:02d}"
+                logger.info(f"Extracted short timestamp from filename: {timestamp_str} (YYMMDDHHMM format)")
+                return dt, timestamp_str, "YYMMDDHHMM"
+            except ValueError as e:
+                logger.warning(f"Invalid short timestamp in filename: {e}")
+                return None, None, None
+
         return None, None, None
     
     @staticmethod
@@ -196,7 +225,7 @@ class FileRenamer:
         return str(new_filepath)
     
     @staticmethod
-    def is_file_ready(file_path, check_delay=2, check_attempts=5):
+    def is_file_ready(file_path, check_delay=3, check_attempts=10):
         """
         Check if a file is ready to be renamed (not being written to)
         
@@ -211,18 +240,18 @@ class FileRenamer:
         import time
         import os
         
+        last_size = -1
         for attempt in range(check_attempts):
             try:
-                # Try to open the file exclusively for writing
-                # On Windows, this will fail if another process has it open
-                # On Unix, this might not be enough depending on how the other process opened it
+                if not os.path.exists(file_path):
+                    return False
+
+                # Windows specific check: Try to rename the file to itself
                 if os.name == 'nt':
-                    # Windows specific check
                     try:
-                        # Try to rename the file to itself - this is a strong indicator of a lock on Windows
                         os.rename(file_path, file_path)
                     except (IOError, OSError):
-                        logger.debug(f"File is locked by another process (Windows rename check)")
+                        logger.debug(f"File is locked (Windows rename check)")
                         raise IOError("File is locked")
                 
                 # Standard check: Try to open for appending
@@ -230,27 +259,18 @@ class FileRenamer:
                     pass
                 
                 # Size stability check
-                with open(file_path, 'rb') as f:
-                    f.seek(0, 2)
-                    file_size = f.tell()
+                current_size = os.path.getsize(file_path)
+                if current_size == last_size and current_size > 0:
+                    logger.info(f"File is ready: {file_path} ({current_size} bytes)")
+                    return True
                 
-                if attempt < check_attempts - 1:
-                    time.sleep(check_delay)
-                    with open(file_path, 'rb') as f:
-                        f.seek(0, 2)
-                        new_size = f.tell()
-                    
-                    if file_size != new_size:
-                        logger.debug(f"File is still being written (size changed: {file_size} -> {new_size})")
-                        continue
-                
-                logger.info(f"File is ready: {file_path} ({file_size} bytes)")
-                return True
+                last_size = current_size
+                logger.debug(f"File size changing or zero: {current_size} (attempt {attempt + 1}/{check_attempts})")
+                time.sleep(check_delay)
             
             except (IOError, OSError) as e:
                 logger.debug(f"File not ready (attempt {attempt + 1}/{check_attempts}): {e}")
-                if attempt < check_attempts - 1:
-                    time.sleep(check_delay)
+                time.sleep(check_delay)
         
         logger.warning(f"File did not become ready after {check_attempts} attempts: {file_path}")
         return False
@@ -268,6 +288,7 @@ class FileRenamer:
         Returns:
             bool: True if successful, False otherwise
         """
+        import time
         try:
             if not os.path.exists(original_path):
                 logger.error(f"Original file does not exist: {original_path}")
@@ -277,7 +298,24 @@ class FileRenamer:
                 logger.info(f"[DRY RUN] Would rename: {original_path} -> {new_path}")
                 return True
             
-            os.rename(original_path, new_path)
+            # Try to rename with retries if file is locked
+            max_retries = 5
+            retry_delay = 2
+            for i in range(max_retries):
+                try:
+                    os.rename(original_path, new_path)
+                    logger.info(f"Successfully renamed: {original_path} -> {new_path}")
+                    return True
+                except (IOError, OSError) as e:
+                    if i < max_retries - 1:
+                        logger.warning(f"Rename attempt {i+1} failed (file locked?), retrying in {retry_delay}s...: {e}")
+                        time.sleep(retry_delay)
+                    else:
+                        raise e
+            return False
+        except Exception as e:
+            logger.error(f"Error renaming file: {e}")
+            return False
             logger.info(f"Successfully renamed: {original_path} -> {new_path}")
             return True
         

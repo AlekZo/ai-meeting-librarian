@@ -65,7 +65,11 @@ def request_json(
             payload = None
         return response, payload
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-        logger.warning(f"HTTP {method} request failed (Connection/Timeout): {url} - {exc}")
+        # Log as debug for Telegram getUpdates to avoid cluttering logs during long-polling
+        if "api.telegram.org" in url and "getUpdates" in url:
+            logger.debug(f"Telegram long-polling timeout/connection issue: {url} - {exc}")
+        else:
+            logger.warning(f"HTTP {method} request failed (Connection/Timeout): {url} - {exc}")
         return None, None
     except Exception as exc:
         logger.error(f"HTTP {method} request failed: {url} - {exc}")

@@ -58,11 +58,25 @@ class GoogleCalendarHandler:
                         try:
                             self.creds.refresh(Request())
                         except Exception as e:
-                            if "network" in str(e).lower() or "connection" in str(e).lower():
+                            error_str = str(e).lower()
+                            if "network" in error_str or "connection" in error_str:
                                 if attempt < retry_attempts - 1:
                                     logger.warning(f"Network error refreshing credentials (attempt {attempt + 1}/{retry_attempts}). Retrying in {retry_delay}s...")
                                     time.sleep(retry_delay)
                                     continue
+                            elif "invalid_grant" in error_str:
+                                # Token has been revoked or expired, need to re-authenticate
+                                logger.warning("Token has been revoked or expired. Forcing re-authentication...")
+                                self.creds = None
+                                # Delete the token file to force new OAuth flow
+                                if os.path.exists(self.token_file):
+                                    try:
+                                        os.remove(self.token_file)
+                                        logger.info(f"Deleted expired token file: {self.token_file}")
+                                    except Exception as del_err:
+                                        logger.warning(f"Could not delete token file: {del_err}")
+                                # Continue to OAuth flow below
+                                continue
                             raise
                     else:
                         if not os.path.exists(self.credentials_file):
@@ -106,6 +120,16 @@ class GoogleCalendarHandler:
                     else:
                         logger.error(f"Network error during authentication after {retry_attempts} attempts: {e}")
                         raise
+                elif "invalid_grant" in error_str:
+                    # Token has been revoked, force re-authentication
+                    logger.warning("Token has been revoked or expired. Will require new authentication on next attempt.")
+                    if os.path.exists(self.token_file):
+                        try:
+                            os.remove(self.token_file)
+                            logger.info(f"Deleted expired token file: {self.token_file}")
+                        except Exception as del_err:
+                            logger.warning(f"Could not delete token file: {del_err}")
+                    raise
                 else:
                     # Non-network error, don't retry
                     raise

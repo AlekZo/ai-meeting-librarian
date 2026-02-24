@@ -64,8 +64,8 @@ class SheetsDriveHandler:
                     token.write(self.creds.to_json())
                 logger.info("Saved Sheets/Drive credentials")
 
-                self.sheets_service = build("sheets", "v4", credentials=self.creds)
-                self.drive_service = build("drive", "v3", credentials=self.creds)
+                self.sheets_service = build("sheets", "v4", credentials=self.creds, cache_discovery=False)
+                self.drive_service = build("drive", "v3", credentials=self.creds, cache_discovery=False)
                 logger.info("Sheets and Drive services initialized")
                 return
             except Exception as e:
@@ -87,6 +87,9 @@ class SheetsDriveHandler:
                     self.creds.refresh(Request())
                     with open(self.token_file, "w") as token:
                         token.write(self.creds.to_json())
+                    # Force re-build services after refresh
+                    self.sheets_service = None
+                    self.drive_service = None
                 except Exception as e:
                     logger.error(f"Failed to refresh Sheets/Drive token: {e}")
                     self.authenticate()
@@ -94,8 +97,8 @@ class SheetsDriveHandler:
                 self.authenticate()
 
         if not self.sheets_service or not self.drive_service:
-            self.sheets_service = build("sheets", "v4", credentials=self.creds)
-            self.drive_service = build("drive", "v3", credentials=self.creds)
+            self.sheets_service = build("sheets", "v4", credentials=self.creds, cache_discovery=False)
+            self.drive_service = build("drive", "v3", credentials=self.creds, cache_discovery=False)
 
     def append_meeting_log(
         self,

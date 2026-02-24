@@ -5,10 +5,11 @@ Logging configuration module
 import logging
 import os
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
 def setup_logging(log_file="logs/auto_renamer.log", level=logging.INFO):
     """
-    Configure logging for the application
+    Configure logging for the application with rotation
     
     Args:
         log_file: Path to the log file
@@ -27,11 +28,12 @@ def setup_logging(log_file="logs/auto_renamer.log", level=logging.INFO):
     if root_logger.handlers:
         root_logger.handlers.clear()
     
-    # File handler
+    # Rotating File handler (10MB per file, keep 5 backups)
     try:
-        file_handler = logging.FileHandler(log_file)
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+        )
         file_handler.setLevel(level)
-        file_handler.flush()  # Flush immediately
         file_formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'

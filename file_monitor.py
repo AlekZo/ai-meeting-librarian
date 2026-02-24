@@ -32,17 +32,42 @@ class VideoFileEventHandler(FileSystemEventHandler):
         file_path = event.src_path
         file_ext = os.path.splitext(file_path)[1].lower()
         
-        # Check if it's a video file
-        if file_ext in self.video_extensions:
-            logger.info(f"New video file detected: {file_path}")
+        # Check if it's a video or audio file
+        if file_ext in self.video_extensions or file_ext in ['.mp3', '.wav', '.ogg', '.m4a', '.flac']:
+            logger.info(f"New media file detected: {file_path}")
             # Call the callback with the file path
             if self.on_video_created:
                 self.on_video_created(file_path)
     
+    def on_moved(self, event):
+        """Handle file move/rename event"""
+        if event.is_directory:
+            return
+        
+        file_path = event.dest_path
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        if file_ext in self.video_extensions or file_ext in ['.mp3', '.wav', '.ogg', '.m4a', '.flac']:
+            logger.info(f"Media file moved/renamed into folder: {file_path}")
+            if self.on_video_created:
+                self.on_video_created(file_path)
+
     def on_modified(self, event):
         """Handle file modification event"""
-        # We primarily care about creation, but this could be useful
-        pass
+        # Some recorders create the file and then write to it, which might not trigger on_created correctly in all environments
+        # or might trigger it before the file is actually ready.
+        if event.is_directory:
+            return
+            
+        file_path = event.src_path
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        if file_ext in self.video_extensions or file_ext in ['.mp3', '.wav', '.ogg', '.m4a', '.flac']:
+            # We use a small trick here: on_video_created already has checks for file readiness and processed status
+            # so calling it on modification is safe and helps catch files that were missed during creation.
+            logger.debug(f"Media file modified: {file_path}")
+            if self.on_video_created:
+                self.on_video_created(file_path)
 
 class FileMonitor:
     """Monitors a directory for new video files"""

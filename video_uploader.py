@@ -69,16 +69,35 @@ class VideoUploader:
             logger.error(f"File not found: {file_path}")
             return
 
-        url = f"{self.base_url}/api/v1/transcription/upload-video"
-        headers = {"X-API-Key": self.api_key}
         file_name = os.path.basename(file_path)
+        file_ext = os.path.splitext(file_name)[1].lower()
+        
+        # Determine endpoint based on file extension
+        if file_ext in ['.mp3', '.wav', '.ogg', '.m4a', '.flac']:
+            url = f"{self.base_url}/api/v1/transcription/submit"
+            file_field = 'audio'
+            mime_type = 'audio/mpeg' if file_ext == '.mp3' else f'audio/{file_ext[1:]}'
+        else:
+            url = f"{self.base_url}/api/v1/transcription/upload-video"
+            file_field = 'video'
+            mime_type = 'video/mp4'
+
+        headers = {"X-API-Key": self.api_key}
 
         try:
             with open(file_path, 'rb') as f:
                 files = {
-                    'video': (file_name, f, 'video/mp4'),
+                    file_field: (file_name, f, mime_type),
                     'title': (None, file_name)
                 }
+                
+                # Add transcription parameters if using /submit
+                if url.endswith("/submit"):
+                    # Add default parameters for /submit
+                    files['diarization'] = (None, 'true')
+                    if meeting_info and meeting_info.get('language'):
+                        files['language'] = (None, meeting_info['language'])
+
                 response, response_data = request_json("POST", url, headers=headers, files=files)
                 if not response:
                     self._save_log(file_path, "ERROR", "Upload failed")
@@ -107,7 +126,13 @@ class VideoUploader:
                     # Move file to output folder after successful upload
                     self._move_file_to_output(file_path)
                     
-                    self.start_transcription(job_id, file_path)
+                    # If we used /submit, transcription is already started
+                    if url.endswith("/submit"):
+                        logger.info(f"Transcription already started via /submit for {job_id}")
+                        # We still need to start polling
+                        threading.Thread(target=self._poll_status, args=(job_id, file_path)).start()
+                    else:
+                        self.start_transcription(job_id, file_path)
             else:
                 logger.error(f"Failed to upload {file_name}. Status: {response.status_code}")
                 self._send_telegram_notification(f"❌ Upload failed: {file_name}")
@@ -154,7 +179,8 @@ class VideoUploader:
         
         device = "cpu" if retry_on_cpu else "cuda"
         compute_type = "int8" if retry_on_cpu else "float16"
-        batch_size = 1 if retry_on_cpu else 8  # Reduced from 12 to 8 for 8GB VRAM stability
+        # Reduced batch_size for long meetings to avoid CUDA OOM
+        batch_size = 1 if retry_on_cpu else 4  # Reduced from 8 to 4 for better stability on long files
 
         # Store start time and params for the notification
         if not hasattr(self, 'job_stats'):
@@ -184,7 +210,7 @@ class VideoUploader:
             "vad_method": "pyannote",
             "vad_onset": 0.55,
             "vad_offset": 0.35,
-            "chunk_size": 30,
+            "chunk_size": 20, # Reduced from 30 to 20 to lower memory pressure during alignment
             "diarize": True,
             "diarize_model": "pyannote",
             "speaker_embeddings": False,
@@ -293,7 +319,20 @@ class VideoUploader:
                             self.start_transcription(job_id, original_file_path, retry_on_cpu=True)
                             break
                         
-                        self._send_telegram_notification(f"❌ Transcription failed: {os.path.basename(original_file_path)}")
+                        # For other failures, offer a manual retry button
+                        retry_cb_id = f"retry_tx_{int(time.time())}"
+                        if hasattr(self, 'main_app'):
+                            self.main_app.callback_map[retry_cb_id] = {
+                                "action": "retry_transcription", 
+                                "job_id": job_id, 
+                                "file_path": original_file_path
+                            }
+                            self.main_app.callback_persistence.save(self.main_app.callback_map)
+
+                        self._send_telegram_notification(
+                            f"❌ Transcription failed: {os.path.basename(original_file_path)}\nError: {error_msg[:100]}...",
+                            reply_markup={"inline_keyboard": [[{"text": "🔄 Retry Transcription", "callback_data": retry_cb_id}]]}
+                        )
                         self._append_to_log(original_file_path, "TRANSCRIPTION_FAILED", 200, data)
                         break
                     else:
