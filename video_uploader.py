@@ -182,18 +182,25 @@ class VideoUploader:
         # Reduced batch_size for long meetings to avoid CUDA OOM
         batch_size = 1 if retry_on_cpu else 4  # Reduced from 8 to 4 for better stability on long files
 
+        # Model configuration
+        model_family = "whisper"
+        model_name = "large-v3"
+        
         # Store start time and params for the notification
         if not hasattr(self, 'job_stats'):
             self.job_stats = {}
         self.job_stats[job_id] = {
             "start_time": time.time(),
             "device": device,
-            "params": f"bs={batch_size}, {compute_type}"
+            "params": f"bs={batch_size}, {compute_type}",
+            "model_family": model_family,
+            "model": model_name,
+            "diarize_model": "pyannote"
         }
 
         payload = {
-            "model_family": "whisper",
-            "model": "large-v3",
+            "model_family": model_family,
+            "model": model_name,
             "model_cache_only": False,
             "device": device,
             "device_index": 0,
@@ -300,7 +307,9 @@ class VideoUploader:
                         self._send_telegram_notification(
                             f"✅ Transcription completed: {os.path.basename(original_file_path)}{stats_text}\n🔗 View on Scriberr: {scriberr_link}"
                         )
-                        self._download_transcript(job_id, original_file_path)
+                        
+                        # Download transcript and send enhanced notification with additional parameters
+                        self._download_transcript_and_notify(job_id, original_file_path)
                         break
                     elif status == "failed":
                         logger.error(f"❌ Transcription failed for job {job_id}")
@@ -344,6 +353,101 @@ class VideoUploader:
             except Exception as e:
                 logger.error(f"Error polling status for job {job_id}: {str(e)}")
                 time.sleep(10)
+
+    def _download_transcript_and_notify(self, job_id, original_file_path):
+        """Download transcript and send enhanced notification with Scriberr parameters."""
+        url = f"{self.base_url}/api/v1/transcription/{job_id}/transcript"
+        headers = {"X-API-Key": self.api_key}
+        
+        try:
+            response, transcript_data = request_json("GET", url, headers=headers)
+            if response and response.status_code == 200 and transcript_data:
+                # Extract statistics from the transcript
+                stats = self._extract_transcript_stats(transcript_data)
+                
+                # Get model information from job stats
+                model_info = {}
+                if hasattr(self, 'job_stats') and job_id in self.job_stats:
+                    job_stats = self.job_stats[job_id]
+                    model_info = {
+                        "model_family": job_stats.get("model_family", ""),
+                        "model": job_stats.get("model", ""),
+                        "diarize_model": job_stats.get("diarize_model", ""),
+                        "device": job_stats.get("device", ""),
+                        "params": job_stats.get("params", "")
+                    }
+                    
+                    # Get model size information
+                    model_details = self._get_model_info(model_info["model_family"], model_info["model"])
+                    if model_details:
+                        model_info["size"] = model_details.get("size")
+                        model_info["model_params"] = model_details.get("params")
+                
+                # Build enhanced notification with additional parameters
+                scriberr_link = f"{self.base_url}/audio/{job_id}"
+                file_name = os.path.basename(original_file_path)
+                
+                # Format additional parameters
+                additional_params = []
+                
+                # Model information section
+                if model_info.get("model_family"):
+                    additional_params.append(f"🤖 LLM: {model_info['model_family'].upper()}")
+                
+                if model_info.get("model"):
+                    model_display = model_info['model']
+                    if model_info.get("size"):
+                        model_display += f" ({model_info['size']})"
+                    additional_params.append(f"🧠 Model: {model_display}")
+                
+                if model_info.get("model_params"):
+                    additional_params.append(f"📊 Parameters: {model_info['model_params']}")
+                
+                if model_info.get("diarize_model"):
+                    additional_params.append(f"👤 Diarization: {model_info['diarize_model']}")
+                
+                if model_info.get("device"):
+                    device_str = model_info['device'].upper()
+                    params_str = model_info.get('params', '')
+                    if params_str:
+                        additional_params.append(f"⚙️ {device_str} | {params_str}")
+                    else:
+                        additional_params.append(f"⚙️ {device_str}")
+                
+                # Transcript statistics section
+                if stats["speakers"]:
+                    additional_params.append(f"👥 Speakers: {stats['speakers']}")
+                
+                if stats["word_count"]:
+                    additional_params.append(f"📝 Words: {stats['word_count']:,}")
+                
+                if stats["segments_count"]:
+                    additional_params.append(f"📋 Segments: {stats['segments_count']}")
+                
+                if stats["language"]:
+                    lang_code = stats["language"].upper() if isinstance(stats["language"], str) else "AUTO"
+                    additional_params.append(f"🌐 Language: {lang_code}")
+                
+                if stats["audio_duration"]:
+                    duration_m, duration_s = divmod(int(stats["audio_duration"]), 60)
+                    duration_str = f"{duration_m}m {duration_s}s" if duration_m > 0 else f"{duration_s}s"
+                    additional_params.append(f"🎵 Audio Duration: {duration_str}")
+                
+                # Build the enhanced message
+                enhanced_message = f"✅ Transcription completed: {file_name}"
+                if additional_params:
+                    enhanced_message += "\n" + " | ".join(additional_params)
+                enhanced_message += f"\n🔗 View on Scriberr: {scriberr_link}"
+                
+                logger.info(f"Sending enhanced notification with stats: {stats}")
+                logger.info(f"Model info: {model_info}")
+                self._send_telegram_notification(enhanced_message)
+                
+        except Exception as e:
+            logger.error(f"Error in enhanced notification: {e}")
+        
+        # Continue with normal transcript processing
+        self._download_transcript(job_id, original_file_path)
 
     def _download_transcript(self, job_id, original_file_path, existing_transcript_data=None, finalize=False):
         url = f"{self.base_url}/api/v1/transcription/{job_id}/transcript"
@@ -1014,6 +1118,81 @@ Format:
             with open(log_path, 'w', encoding='utf-8') as f:
                 json.dump(log_data, f, indent=4, ensure_ascii=False)
         except Exception: pass
+
+    def _get_model_info(self, model_family, model_name):
+        """Get detailed model information including size."""
+        model_sizes = {
+            "whisper": {
+                "tiny": {"size": "39MB", "params": "39M"},
+                "base": {"size": "140MB", "params": "74M"},
+                "small": {"size": "461MB", "params": "244M"},
+                "medium": {"size": "1.5GB", "params": "769M"},
+                "large": {"size": "2.9GB", "params": "1.5B"},
+                "large-v3": {"size": "2.9GB", "params": "1.5B"},
+                "large-v2": {"size": "2.9GB", "params": "1.5B"},
+                "large-v1": {"size": "2.9GB", "params": "1.5B"}
+            }
+        }
+        
+        try:
+            if model_family and model_family in model_sizes:
+                if model_name and model_name in model_sizes[model_family]:
+                    return model_sizes[model_family][model_name]
+        except Exception:
+            pass
+        
+        return None
+
+    def _extract_transcript_stats(self, transcript_data):
+        """Extract additional statistics from transcript data for better notifications."""
+        stats = {
+            "word_count": 0,
+            "speakers": set(),
+            "segments_count": 0,
+            "language": None,
+            "audio_duration": None
+        }
+        
+        try:
+            # Get segments
+            segments = self._find_segments(transcript_data)
+            if segments:
+                stats["segments_count"] = len(segments)
+                
+                for segment in segments:
+                    # Count words
+                    text = segment.get("text") or segment.get("transcript") or segment.get("utterance") or ""
+                    stats["word_count"] += len(text.split())
+                    
+                    # Collect unique speakers
+                    speaker = (
+                        segment.get("speaker")
+                        or segment.get("speaker_id")
+                        or segment.get("speaker_label")
+                        or segment.get("speaker_name")
+                    )
+                    if speaker:
+                        stats["speakers"].add(speaker)
+                    
+                    # Get audio duration from last segment
+                    end = segment.get("end") or segment.get("end_time") or 0
+                    if end > (stats["audio_duration"] or 0):
+                        stats["audio_duration"] = end
+            
+            # Get language
+            if "language" in transcript_data:
+                stats["language"] = transcript_data["language"]
+            elif "language_code" in transcript_data:
+                stats["language"] = transcript_data["language_code"]
+            
+            # Convert speakers set to count
+            speaker_count = len(stats["speakers"])
+            stats["speakers"] = speaker_count
+            
+        except Exception as e:
+            logger.warning(f"Error extracting transcript stats: {e}")
+        
+        return stats
 
     def _get_openrouter_response(self, prompt):
         api_key = self.config.get("openrouter_api_key")

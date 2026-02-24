@@ -14,8 +14,8 @@ DEFAULT_CONFIG = {
     "google_credentials_path": "credentials.json",
     "google_token_path": "token.json",
     "video_extensions": [".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv"],
-    "file_lock_check_delay": 2,  # seconds
-    "file_lock_check_attempts": 5,
+    "file_lock_check_delay": 3,  # seconds (increased for Nextcloud sync)
+    "file_lock_check_attempts": 30,  # increased from 5 to 30 for Nextcloud compatibility (90 seconds total)
     "log_level": "INFO",
     "enable_logging": True,
     "log_file": "logs/auto_renamer.log",

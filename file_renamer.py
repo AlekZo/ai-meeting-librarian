@@ -228,6 +228,7 @@ class FileRenamer:
     def is_file_ready(file_path, check_delay=3, check_attempts=10):
         """
         Check if a file is ready to be renamed (not being written to)
+        Optimized for Nextcloud-synced files
         
         Args:
             file_path: Path to the file
@@ -241,38 +242,67 @@ class FileRenamer:
         import os
         
         last_size = -1
+        stable_count = 0
+        required_stable_checks = 2  # Require 2 consecutive size checks to be stable
+        
         for attempt in range(check_attempts):
             try:
                 if not os.path.exists(file_path):
+                    logger.debug(f"File does not exist: {file_path}")
                     return False
 
+                # Get current file size
+                current_size = os.path.getsize(file_path)
+                logger.debug(f"File size check (attempt {attempt + 1}/{check_attempts}): {current_size} bytes, last_size={last_size}")
+                
                 # Windows specific check: Try to rename the file to itself
+                # This is non-blocking - we don't fail if this fails for Nextcloud files
+                rename_ok = True
                 if os.name == 'nt':
                     try:
                         os.rename(file_path, file_path)
-                    except (IOError, OSError):
-                        logger.debug(f"File is locked (Windows rename check)")
-                        raise IOError("File is locked")
+                        logger.debug(f"Windows rename check passed")
+                    except (IOError, OSError) as e:
+                        logger.debug(f"Windows rename check failed (Nextcloud lock?): {e}")
+                        rename_ok = False
                 
-                # Standard check: Try to open for appending
-                with open(file_path, 'ab') as f:
-                    pass
+                # Standard check: Try to open for reading (less restrictive than appending)
+                # This checks if file is accessible without modifying it
+                append_ok = True
+                try:
+                    with open(file_path, 'rb') as f:
+                        # Try to read a small amount to verify accessibility
+                        f.read(1)
+                    logger.debug(f"File read check passed")
+                except (IOError, OSError) as e:
+                    logger.debug(f"File read check failed (still being written?): {e}")
+                    append_ok = False
                 
                 # Size stability check
-                current_size = os.path.getsize(file_path)
-                if current_size == last_size and current_size > 0:
-                    logger.info(f"File is ready: {file_path} ({current_size} bytes)")
-                    return True
+                if current_size == last_size:
+                    stable_count += 1
+                    logger.debug(f"Size stable: {current_size} bytes (stable_count={stable_count}/{required_stable_checks})")
+                else:
+                    stable_count = 0
+                    logger.debug(f"Size changed: {last_size} -> {current_size} bytes (resetting stable count)")
                 
                 last_size = current_size
-                logger.debug(f"File size changing or zero: {current_size} (attempt {attempt + 1}/{check_attempts})")
+                
+                # File is ready if:
+                # 1. Size is stable (not currently being written to)
+                # 2. We can read it (accessible)
+                # 3. File has some content OR it's a Nextcloud file that might be legitimately empty
+                if stable_count >= required_stable_checks and append_ok and current_size >= 0:
+                    logger.info(f"✓ File is ready: {file_path} ({current_size} bytes, stable={stable_count} checks)")
+                    return True
+                
                 time.sleep(check_delay)
             
-            except (IOError, OSError) as e:
-                logger.debug(f"File not ready (attempt {attempt + 1}/{check_attempts}): {e}")
+            except Exception as e:
+                logger.debug(f"Unexpected error in readiness check (attempt {attempt + 1}/{check_attempts}): {e}")
                 time.sleep(check_delay)
         
-        logger.warning(f"File did not become ready after {check_attempts} attempts: {file_path}")
+        logger.warning(f"File did not become ready after {check_attempts} attempts ({check_attempts * check_delay}s total): {file_path}")
         return False
     
     @staticmethod

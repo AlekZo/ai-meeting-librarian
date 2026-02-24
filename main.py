@@ -216,6 +216,9 @@ class AutoMeetingVideoRenamer:
         # Start Google Auth and Sheets initialization in background
         threading.Thread(target=self._bg_initialize_cloud_services, daemon=True).start()
         
+        # Set up Telegram bot menu commands
+        self._setup_telegram_menu()
+        
         return True
 
     def _bg_initialize_cloud_services(self):
@@ -844,6 +847,26 @@ class AutoMeetingVideoRenamer:
             self._send_recent_recordings_menu(10, chat_id=chat_id)
             return
 
+        if data == "menu_stuck_files":
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            self._send_stuck_files_menu(chat_id)
+            return
+
+        if data == "back_to_menu":
+            # Remove buttons and show main menu
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            self._send_main_menu(chat_id)
+            return
+
         # Look up full data from short ID
         cb_data = self.callback_map.get(data)
         if not cb_data:
@@ -1087,6 +1110,19 @@ class AutoMeetingVideoRenamer:
                 file_name = cb_data.get("file_name", "Meeting")
                 dummy_transcript = {"title": file_name}
                 self.uploader._offer_manual_speaker_assignment(job_id, all_speakers, dummy_transcript)
+
+        elif cb_data["action"] == "stuck_move":
+            file_path = cb_data.get("file_path")
+            # Remove buttons
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            if file_path and os.path.exists(file_path):
+                threading.Thread(target=self._move_stuck_file, args=(file_path, chat_id)).start()
+            else:
+                self.uploader._send_telegram_notification("❌ File not found.")
 
         elif cb_data["action"] == "offer_swap":
             job_id = cb_data["job_id"]
@@ -1540,6 +1576,10 @@ class AutoMeetingVideoRenamer:
             self._send_recent_recordings_menu(count, chat_id=chat_id)
             return
 
+        if text.startswith("/stuck"):
+            self._send_stuck_files_menu(chat_id)
+            return
+
         if text.startswith("/menu") or text.startswith("/start"):
             self._send_main_menu(chat_id)
             return
@@ -1765,6 +1805,9 @@ class AutoMeetingVideoRenamer:
         keyboard = [
             [
                 {"text": "📂 Recent recordings (10)", "callback_data": "menu_recent_10"}
+            ],
+            [
+                {"text": "🔍 Check Stuck Files", "callback_data": "menu_stuck_files"}
             ]
         ]
 
@@ -1777,6 +1820,173 @@ class AutoMeetingVideoRenamer:
                 "reply_markup": {"inline_keyboard": keyboard}
             }
         )
+
+    def _setup_telegram_menu(self):
+        """Set up Telegram bot command menu - visible in chat"""
+        token = self.config.get("telegram_bot_token")
+        if not token:
+            logger.debug("Telegram token not configured, skipping menu setup")
+            return
+        
+        try:
+            commands = [
+                {"command": "menu", "description": "📂 Show main menu"},
+                {"command": "stuck", "description": "🔍 Check stuck files"},
+                {"command": "recent", "description": "📹 Show recent recordings"},
+            ]
+            
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/setMyCommands",
+                json_body={"commands": commands}
+            )
+            logger.info("✓ Telegram bot menu commands set successfully")
+        except Exception as e:
+            logger.error(f"Failed to set Telegram menu commands: {e}")
+
+    def _get_stuck_files(self):
+        """Get list of files stuck in the renamed_folder"""
+        renamed_folder = self.config.get("renamed_folder")
+        if not renamed_folder or not os.path.isdir(renamed_folder):
+            return []
+        
+        extensions = set(self.config.get("video_extensions", []))
+        stuck_files = []
+        
+        try:
+            for name in os.listdir(renamed_folder):
+                full_path = os.path.join(renamed_folder, name)
+                if not os.path.isfile(full_path):
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if extensions and ext not in extensions:
+                    continue
+                try:
+                    mtime = os.path.getmtime(full_path)
+                    size = os.path.getsize(full_path)
+                except Exception:
+                    continue
+                stuck_files.append({
+                    "path": full_path,
+                    "name": name,
+                    "mtime": mtime,
+                    "size": size
+                })
+        except Exception as e:
+            logger.error(f"Error listing stuck files: {e}")
+        
+        # Sort by modification time (newest first)
+        stuck_files.sort(key=lambda x: x["mtime"], reverse=True)
+        return stuck_files
+
+    def _send_stuck_files_menu(self, chat_id):
+        """Send a menu with stuck files in renamed_folder, grouped by date"""
+        token = self.config.get("telegram_bot_token")
+        if not token:
+            return
+        
+        stuck_files = self._get_stuck_files()
+        
+        if not stuck_files:
+            self.uploader._send_telegram_notification(
+                "✅ No stuck files found! All files in the Renamed folder are being processed.",
+                reply_markup={"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "back_to_menu"}]]}
+            )
+            return
+        
+        # Group files by date
+        from datetime import datetime as dt_module
+        files_by_date = {}
+        
+        for file_info in stuck_files:
+            file_date = dt_module.fromtimestamp(file_info["mtime"])
+            date_key = file_date.strftime("%Y-%m-%d")  # Group by date
+            
+            if date_key not in files_by_date:
+                files_by_date[date_key] = []
+            files_by_date[date_key].append((file_date, file_info))
+        
+        # Build message with grouped files
+        message = f"📁 Found {len(stuck_files)} stuck file(s) in Renamed folder:\n\n"
+        
+        keyboard = []
+        file_count = 0
+        
+        # Sort dates in reverse (newest first)
+        for date_key in sorted(files_by_date.keys(), reverse=True):
+            files_on_date = files_by_date[date_key]
+            # Sort files within date by time (newest first)
+            files_on_date.sort(key=lambda x: x[0], reverse=True)
+            
+            message += f"📅 {date_key}\n"
+            
+            for file_date, file_info in files_on_date:
+                file_count += 1
+                if file_count > 20:  # Limit to 20 files
+                    break
+                
+                filename = file_info["name"]
+                time_str = file_date.strftime("%H:%M:%S")
+                size_mb = file_info["size"] / (1024 * 1024)
+                
+                cb_id = self._gen_cb_id("stuck")
+                self.callback_map[cb_id] = {
+                    "action": "stuck_move",
+                    "file_path": file_info["path"]
+                }
+                
+                # Create button with time and filename
+                display_name = filename[:35] + "..." if len(filename) > 35 else filename
+                button_text = f"⏰ {time_str} | {display_name}"
+                
+                keyboard.append([{"text": button_text, "callback_data": cb_id}])
+                message += f"  {time_str} | {size_mb:.1f}MB\n"
+            
+            if file_count > 20:
+                break
+            message += "\n"
+        
+        self.callback_persistence.save(self.callback_map)
+        
+        message += f"\nShowing {file_count} most recent files.\n"
+        message += "👇 Select a file to move it to ToTranscribe folder:"
+        
+        request_json(
+            "POST",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json_body={
+                "chat_id": chat_id,
+                "text": message,
+                "reply_markup": {"inline_keyboard": keyboard}
+            }
+        )
+
+    def _move_stuck_file(self, file_path, chat_id=None):
+        """Move a stuck file from renamed_folder to to_transcribe_folder"""
+        to_transcribe = self.config.get("to_transcribe_folder")
+        
+        if not to_transcribe:
+            logger.error("to_transcribe_folder not configured")
+            if chat_id:
+                self.uploader._send_telegram_notification("❌ to_transcribe_folder not configured")
+            return False
+        
+        try:
+            os.makedirs(to_transcribe, exist_ok=True)
+            filename = os.path.basename(file_path)
+            dest_path = self._get_unique_destination(to_transcribe, filename)
+            
+            shutil.move(file_path, dest_path)
+            logger.info(f"✓ Moved stuck file from Renamed to ToTranscribe: {filename}")
+            
+            if chat_id:
+                self.uploader._send_telegram_notification(f"✅ Moved to ToTranscribe: {filename}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to move stuck file: {e}")
+            if chat_id:
+                self.uploader._send_telegram_notification(f"❌ Failed to move {os.path.basename(file_path)}: {str(e)}")
+            return False
 
     def _get_unique_destination(self, folder, filename):
         """Avoid overwriting existing files by appending a suffix."""
