@@ -17,8 +17,10 @@ logger = logging.getLogger(__name__)
 # - 2026-01-23T10:01:46Z (ISO 8601 format with timezone)
 # - 2026-01-23T10:01:46 (ISO 8601 format without timezone)
 # - 2602061401 (YYMMDDHHMM format)
+# - 18_Feb_26 (DD_Mon_YY format)
 TIMESTAMP_PATTERN = r'(\d{4})-(\d{2})-(\d{2})(?:[T_](\d{2}):(\d{2}):(\d{2})|_(\d{2})-(\d{2})-(\d{2}))?'
 SHORT_TIMESTAMP_PATTERN = r'(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})'
+DATE_MON_YY_PATTERN = r'(\d{1,2})_(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)_(\d{2})'
 
 class FileRenamer:
     """Handles file renaming logic"""
@@ -63,6 +65,11 @@ class FileRenamer:
         match_short = re.search(SHORT_TIMESTAMP_PATTERN, filename)
         if match_short:
             return match_short.group(0)
+        
+        # Try DD_Mon_YY pattern
+        match_mon_yy = re.search(DATE_MON_YY_PATTERN, filename, re.IGNORECASE)
+        if match_mon_yy:
+            return match_mon_yy.group(0)
             
         return None
 
@@ -75,6 +82,7 @@ class FileRenamer:
         - Ердакова Надежда_2026-01-23T10:01:46Z.mp4 (ISO 8601 with timezone)
         - Ердакова Надежда_2026-01-23T10:01:46.mp4 (ISO 8601 without timezone)
         - Кирилл Хаустов ПСБ-2602061401.mp3 (YYMMDDHHMM)
+        - Meeting_Notes_18_Feb_26.mp4 (DD_Mon_YY format)
         
         Args:
             filename: Filename to extract timestamp from
@@ -126,6 +134,34 @@ class FileRenamer:
                 return dt, timestamp_str, "YYMMDDHHMM"
             except ValueError as e:
                 logger.warning(f"Invalid short timestamp in filename: {e}")
+                return None, None, None
+
+        # Try DD_Mon_YY pattern (e.g., 18_Feb_26)
+        match_mon_yy = re.search(DATE_MON_YY_PATTERN, filename, re.IGNORECASE)
+        if match_mon_yy:
+            groups = match_mon_yy.groups()
+            try:
+                day = int(groups[0])
+                month_name = groups[1]
+                year = 2000 + int(groups[2])
+                
+                # Convert month name to month number
+                month_map = {
+                    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+                }
+                month = month_map.get(month_name.lower())
+                if not month:
+                    logger.warning(f"Unknown month name in filename: {month_name}")
+                    return None, None, None
+                
+                hour, minute, second = 0, 0, 0  # No time component in this format
+                dt = datetime(year, month, day, hour, minute, second)
+                timestamp_str = f"{year:04d}-{month:02d}-{day:02d}_{hour:02d}-{minute:02d}-{second:02d}"
+                logger.info(f"Extracted DD_Mon_YY timestamp from filename: {timestamp_str} (DD_Mon_YY format)")
+                return dt, timestamp_str, "DD_Mon_YY"
+            except ValueError as e:
+                logger.warning(f"Invalid DD_Mon_YY timestamp in filename: {e}")
                 return None, None, None
 
         return None, None, None

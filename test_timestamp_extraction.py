@@ -11,7 +11,11 @@ from datetime import datetime
 # - 2026-01-22 (date only)
 # - 2026-01-23T10:01:46Z (ISO 8601 format with timezone)
 # - 2026-01-23T10:01:46 (ISO 8601 format without timezone)
+# - 2602061401 (YYMMDDHHMM format)
+# - 18_Feb_26 (DD_Mon_YY format)
 TIMESTAMP_PATTERN = r'(\d{4})-(\d{2})-(\d{2})(?:[T_](\d{2}):(\d{2}):(\d{2})|_(\d{2})-(\d{2})-(\d{2}))?'
+SHORT_TIMESTAMP_PATTERN = r'(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})'
+DATE_MON_YY_PATTERN = r'(\d{1,2})_(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)_(\d{2})'
 
 def extract_timestamp(filename):
     """Extract timestamp from filename"""
@@ -39,6 +43,48 @@ def extract_timestamp(filename):
             return True, timestamp_str, format_type, dt
         except ValueError as e:
             return False, None, None, str(e)
+    
+    # Try short pattern (YYMMDDHHMM)
+    match_short = re.search(SHORT_TIMESTAMP_PATTERN, filename)
+    if match_short:
+        groups = match_short.groups()
+        try:
+            year = 2000 + int(groups[0])
+            month, day = int(groups[1]), int(groups[2])
+            hour, minute = int(groups[3]), int(groups[4])
+            second = 0
+            
+            dt = datetime(year, month, day, hour, minute, second)
+            timestamp_str = f"{year:04d}-{month:02d}-{day:02d}_{hour:02d}-{minute:02d}-{second:02d}"
+            return True, timestamp_str, "YYMMDDHHMM", dt
+        except ValueError as e:
+            return False, None, None, str(e)
+    
+    # Try DD_Mon_YY pattern
+    match_mon_yy = re.search(DATE_MON_YY_PATTERN, filename, re.IGNORECASE)
+    if match_mon_yy:
+        groups = match_mon_yy.groups()
+        try:
+            day = int(groups[0])
+            month_name = groups[1]
+            year = 2000 + int(groups[2])
+            
+            # Convert month name to month number
+            month_map = {
+                'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+            }
+            month = month_map.get(month_name.lower())
+            if not month:
+                return False, None, None, f"Unknown month: {month_name}"
+            
+            hour, minute, second = 0, 0, 0
+            dt = datetime(year, month, day, hour, minute, second)
+            timestamp_str = f"{year:04d}-{month:02d}-{day:02d}_{hour:02d}-{minute:02d}-{second:02d}"
+            return True, timestamp_str, "DD_Mon_YY", dt
+        except ValueError as e:
+            return False, None, None, str(e)
+    
     return False, None, None, "No match"
 
 # Test cases
@@ -51,6 +97,9 @@ test_cases = [
     ("Ердакова Надежда_2026-01-23T10:01:46.mp4", "2026-01-23_10-01-46", "ISO 8601"),
     ("Meeting_2026-01-25T14:30:00Z.mp4", "2026-01-25_14-30-00", "ISO 8601"),
     ("2026-01-20_10-00-00.mp4", "2026-01-20_10-00-00", "underscore with hyphens"),
+    ("Meeting_Notes_18_Feb_26_lang_en.mp4", "2026-02-18_00-00-00", "DD_Mon_YY"),
+    ("MyVideo_5_Jan_26.mp4", "2026-01-05_00-00-00", "DD_Mon_YY"),
+    ("Recording_31_Dec_25.mp4", "2025-12-31_00-00-00", "DD_Mon_YY"),
 ]
 
 print("=" * 100)
