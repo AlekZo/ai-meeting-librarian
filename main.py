@@ -40,6 +40,7 @@ from sheets_drive_handler import SheetsDriveHandler
 from meeting_log_queue import MeetingLogQueue
 from callback_persistence import CallbackPersistence
 from system_tray import SystemTrayIcon
+from storage_utils import locked_load_json, locked_save_json
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ class AutoMeetingVideoRenamer:
         self.pending_files = []  # Queue for files detected while offline
         self.internet_available = False
         self.files_pending_user_action = set()  # Track files waiting for user input to prevent loops
+        self.telegram_status_message_id = None
+        self.last_event = None
         
         self.callback_persistence = CallbackPersistence()
         self.callback_map = self.callback_persistence.load() # Map short IDs to full data for Telegram buttons
@@ -95,31 +98,19 @@ class AutoMeetingVideoRenamer:
         return f"{prefix}_{int(time.time())}_{self._cb_counter}"
 
     def _load_user_states(self):
-        if os.path.exists(self.user_states_path):
-            try:
-                with open(self.user_states_path, 'r') as f:
-                    return json.load(f)
-            except: pass
-        return {}
+        return locked_load_json(self.user_states_path, {})
 
     def _save_user_states(self):
         try:
-            with open(self.user_states_path, 'w') as f:
-                json.dump(self.user_states, f)
+            locked_save_json(self.user_states_path, self.user_states, indent=2, ensure_ascii=False)
         except: pass
 
     def _load_active_mappings(self):
-        if os.path.exists(self.active_mappings_path):
-            try:
-                with open(self.active_mappings_path, 'r') as f:
-                    return json.load(f)
-            except: pass
-        return {}
+        return locked_load_json(self.active_mappings_path, {})
 
     def _save_active_mappings(self):
         try:
-            with open(self.active_mappings_path, 'w') as f:
-                json.dump(self.active_mappings, f)
+            locked_save_json(self.active_mappings_path, self.active_mappings, indent=2, ensure_ascii=False)
         except: pass
     
     @staticmethod
@@ -442,31 +433,102 @@ class AutoMeetingVideoRenamer:
             logger.warning(f"Internet not available. Queueing file for later processing: {file_path}")
             if file_path not in self.pending_files:
                 self.pending_files.append(file_path)
+                if len(self.pending_files) >= 2:
+                    self._send_pending_files_summary()
             return True
         return False
 
+    def update_telegram_status(self, message, chat_id=None):
+        """Update a single global Telegram status message."""
+        token = self.config.get("telegram_bot_token")
+        chat_id = chat_id or self.config.get("telegram_chat_id")
+        if not token or not chat_id:
+            return
+
+        self.last_event = {
+            "text": message,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        if self.telegram_status_message_id:
+            response, _ = request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json_body={
+                    "chat_id": chat_id,
+                    "message_id": self.telegram_status_message_id,
+                    "text": message,
+                },
+            )
+            if response and response.status_code == 200:
+                return
+
+        response, payload = request_json(
+            "POST",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json_body={"chat_id": chat_id, "text": message},
+        )
+        if response and response.status_code == 200 and payload:
+            self.telegram_status_message_id = payload.get("result", {}).get("message_id")
+
+    def _send_pending_files_summary(self):
+        """Send a batch summary for queued files with Process All / Skip All."""
+        token = self.config.get("telegram_bot_token")
+        chat_id = self.config.get("telegram_chat_id")
+        if not token or not chat_id:
+            return
+
+        if not self.pending_files:
+            return
+
+        display = []
+        for i, path in enumerate(self.pending_files[:10], start=1):
+            display.append(f"{i}. {os.path.basename(path)}")
+
+        cb_process = self._gen_cb_id("pending_process")
+        cb_skip = self._gen_cb_id("pending_skip")
+        self.callback_map[cb_process] = {"action": "pending_process_all"}
+        self.callback_map[cb_skip] = {"action": "pending_skip_all"}
+        self.callback_persistence.save(self.callback_map)
+
+        text = "📦 Pending files queued (offline):\n" + "\n".join(display)
+        if len(self.pending_files) > 10:
+            text += f"\n...and {len(self.pending_files) - 10} more"
+
+        request_json(
+            "POST",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json_body={
+                "chat_id": chat_id,
+                "text": text,
+                "reply_markup": {
+                    "inline_keyboard": [[
+                        {"text": "✅ Process All", "callback_data": cb_process},
+                        {"text": "⏭️ Skip All", "callback_data": cb_skip}
+                    ]]
+                },
+            },
+        )
+
     def _load_processed_watch_files(self):
         os.makedirs(os.path.dirname(self.processed_watch_files_path), exist_ok=True)
-        if not os.path.exists(self.processed_watch_files_path):
-            return {}
-        try:
-            with open(self.processed_watch_files_path, "r", encoding="utf-8") as f:
-                items = json.load(f)
-            processed = {}
-            for item in items if isinstance(items, list) else []:
-                path = item.get("path")
-                if path:
-                    processed[path] = item
-            return processed
-        except Exception as e:
-            logger.error(f"Failed to load processed watch files: {e}")
-            return {}
+        items = locked_load_json(self.processed_watch_files_path, [])
+        processed = {}
+        for item in items if isinstance(items, list) else []:
+            path = item.get("path")
+            if path:
+                processed[path] = item
+        return processed
 
     def _save_processed_watch_files(self):
         try:
             os.makedirs(os.path.dirname(self.processed_watch_files_path), exist_ok=True)
-            with open(self.processed_watch_files_path, "w", encoding="utf-8") as f:
-                json.dump(list(self.processed_watch_files.values()), f, indent=2)
+            locked_save_json(
+                self.processed_watch_files_path,
+                list(self.processed_watch_files.values()),
+                indent=2,
+                ensure_ascii=False,
+            )
         except Exception as e:
             logger.error(f"Failed to save processed watch files: {e}")
 
@@ -495,26 +557,23 @@ class AutoMeetingVideoRenamer:
 
     def _load_processed_transcribe_files(self):
         os.makedirs(os.path.dirname(self.processed_transcribe_files_path), exist_ok=True)
-        if not os.path.exists(self.processed_transcribe_files_path):
-            return {}
-        try:
-            with open(self.processed_transcribe_files_path, "r", encoding="utf-8") as f:
-                items = json.load(f)
-            processed = {}
-            for item in items if isinstance(items, list) else []:
-                path = item.get("path")
-                if path:
-                    processed[path] = item
-            return processed
-        except Exception as e:
-            logger.error(f"Failed to load processed transcribe files: {e}")
-            return {}
+        items = locked_load_json(self.processed_transcribe_files_path, [])
+        processed = {}
+        for item in items if isinstance(items, list) else []:
+            path = item.get("path")
+            if path:
+                processed[path] = item
+        return processed
 
     def _save_processed_transcribe_files(self):
         try:
             os.makedirs(os.path.dirname(self.processed_transcribe_files_path), exist_ok=True)
-            with open(self.processed_transcribe_files_path, "w", encoding="utf-8") as f:
-                json.dump(list(self.processed_transcribe_files.values()), f, indent=2)
+            locked_save_json(
+                self.processed_transcribe_files_path,
+                list(self.processed_transcribe_files.values()),
+                indent=2,
+                ensure_ascii=False,
+            )
         except Exception as e:
             logger.error(f"Failed to save processed transcribe files: {e}")
 
@@ -610,6 +669,14 @@ class AutoMeetingVideoRenamer:
         self.files_pending_user_action.add(file_path)
         
         buttons = []
+        time_range = ""
+        try:
+            from dateutil import parser
+            file_dt, _, _ = FileRenamer.extract_timestamp_from_filename(filename)
+            if file_dt:
+                time_range = f"Recorded: {file_dt.strftime('%Y-%m-%d %H:%M')}"
+        except Exception:
+            pass
         for i, meeting in enumerate(meetings[:10]):  # Show up to 10 meetings
             title = meeting.get('summary', 'Unknown')
             meeting_time = meeting.get('start', {}).get('dateTime') or meeting.get('start', {}).get('date')
@@ -625,7 +692,7 @@ class AutoMeetingVideoRenamer:
                 "meeting_id": meeting_id
             }
             
-            # Add time to button label for clarity
+            # Add time range to button label for clarity
             time_str = ""
             if meeting_time:
                 try:
@@ -651,8 +718,11 @@ class AutoMeetingVideoRenamer:
         buttons.append([{"text": "✏️ Manual Name", "callback_data": manual_id}])
         buttons.append([{"text": "❌ Cancel", "callback_data": cancel_id}])
 
+        header = f"📂 Multiple meetings found for: {filename}\nWhich one should I use?"
+        if time_range:
+            header = f"{header}\n{time_range}"
         self.uploader._send_telegram_notification(
-            f"📂 Multiple meetings found for: {filename}\nWhich one should I use?",
+            header,
             reply_markup={"inline_keyboard": buttons}
         )
 
@@ -686,7 +756,7 @@ class AutoMeetingVideoRenamer:
                     os.makedirs(to_transcribe, exist_ok=True)
                     logger.info(f"Ensured transcription folder exists: {to_transcribe}")
                     
-                    max_move_retries = 5
+                    max_move_retries = 10
                     move_retry_delay = 2
                     for i in range(max_move_retries):
                         try:
@@ -696,7 +766,7 @@ class AutoMeetingVideoRenamer:
                             return final_path
                         except Exception as e:
                             if i < max_move_retries - 1:
-                                logger.warning(f"Move attempt {i+1} failed, retrying in {move_retry_delay}s...: {e}")
+                                logger.warning(f"Move attempt {i+1}/{max_move_retries} failed, retrying in {move_retry_delay}s...: {e}")
                                 time.sleep(move_retry_delay)
                             else:
                                 logger.error(f"Failed to move file to transcription folder after retries: {e}")
@@ -867,6 +937,36 @@ class AutoMeetingVideoRenamer:
             self._send_main_menu(chat_id)
             return
 
+        if data == "show_status" or data == "show_queue" or data == "show_last":
+            # Remove buttons and send status
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+            if data == "show_status":
+                queue_len = self.meeting_queue.get_queue_size() if hasattr(self.meeting_queue, "get_queue_size") else 0
+                pending_len = len(self.pending_files)
+                status = "Online" if self.internet_available else "Offline"
+                text = f"🧭 Status: {status}\n📦 Pending files: {pending_len}\n🧾 Meeting log queue: {queue_len}"
+                self.uploader._send_telegram_notification(text)
+            elif data == "show_queue":
+                pending_len = len(self.pending_files)
+                if pending_len == 0:
+                    self.uploader._send_telegram_notification("📦 Pending files: 0")
+                else:
+                    names = "\n".join([f"• {os.path.basename(p)}" for p in self.pending_files[:10]])
+                    more = f"\n...and {pending_len - 10} more" if pending_len > 10 else ""
+                    self.uploader._send_telegram_notification(f"📦 Pending files ({pending_len}):\n{names}{more}")
+            else:
+                if self.last_event:
+                    self.uploader._send_telegram_notification(
+                        f"🕒 Last event ({self.last_event['time']}):\n{self.last_event['text']}"
+                    )
+                else:
+                    self.uploader._send_telegram_notification("ℹ️ No recent events.")
+            return
+
         # Look up full data from short ID
         cb_data = self.callback_map.get(data)
         if not cb_data:
@@ -884,7 +984,7 @@ class AutoMeetingVideoRenamer:
             file_path = cb_data["file_path"]
             meeting_time = cb_data.get("meeting_time")
             logger.info(f"User selected meeting via Telegram: {meeting_title} for {file_path}")
-            self.uploader._send_telegram_notification(f"✅ Selected: {meeting_title}. Processing...")
+            self.update_telegram_status(f"✅ Selected: {meeting_title}. Processing...")
             
             # Remove from pending user action
             self.files_pending_user_action.discard(file_path)
@@ -901,7 +1001,7 @@ class AutoMeetingVideoRenamer:
         elif cb_data["action"] == "retry":
             file_path = cb_data["file_path"]
             logger.info(f"User requested retry via Telegram for: {file_path}")
-            self.uploader._send_telegram_notification("🔄 Retrying calendar lookup...")
+            self.update_telegram_status("🔄 Retrying calendar lookup...")
             
             # Remove from pending user action since we're retrying
             self.files_pending_user_action.discard(file_path)
@@ -921,6 +1021,7 @@ class AutoMeetingVideoRenamer:
         elif cb_data["action"] == "keep_name":
             file_path = cb_data.get("file_path")
             logger.info(f"User chose to keep current name for: {file_path}")
+            self.update_telegram_status(f"💾 Keeping name: {os.path.basename(file_path)}")
             
             # Remove from pending user action
             self.files_pending_user_action.discard(file_path)
@@ -947,6 +1048,7 @@ class AutoMeetingVideoRenamer:
         elif cb_data["action"] == "skip":
             file_path = cb_data.get("file_path")
             logger.info(f"User canceled meeting selection for: {file_path}")
+            self.update_telegram_status(f"⏭️ Skipped: {os.path.basename(file_path) if file_path else 'Unknown'}")
             
             # Remove from pending user action
             if file_path and file_path != "rename_cancel":
@@ -967,6 +1069,7 @@ class AutoMeetingVideoRenamer:
             job_id = cb_data.get("job_id")
             file_path = cb_data.get("file_path")
             logger.info(f"User requested cancellation for job {job_id}")
+            self.update_telegram_status(f"🛑 Canceled: {os.path.basename(file_path) if file_path else 'Unknown'}")
             
             # Remove buttons
             request_json(
@@ -991,6 +1094,7 @@ class AutoMeetingVideoRenamer:
             job_id = cb_data.get("job_id")
             file_path = cb_data.get("file_path")
             logger.info(f"User requested retry for job {job_id}")
+            self.update_telegram_status(f"🔄 Retrying transcription: {os.path.basename(file_path)}")
             
             # Remove buttons
             request_json(
@@ -1012,6 +1116,9 @@ class AutoMeetingVideoRenamer:
                 f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
                 json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
             )
+            self.update_telegram_status(
+                f"📤 Queued for transcription ({language.upper() if language else 'AUTO'}): {os.path.basename(file_path)}"
+            )
             threading.Thread(target=self._move_to_transcribe_folder, args=(file_path, language)).start()
 
         elif cb_data["action"] == "skip_transcribe":
@@ -1022,6 +1129,7 @@ class AutoMeetingVideoRenamer:
                 f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
                 json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
             )
+            self.update_telegram_status(f"⏭️ Skipped transcription: {os.path.basename(file_path)}")
             self.uploader._send_telegram_notification(f"⏭️ Skipped transcription for: {os.path.basename(file_path)}")
 
         elif cb_data["action"] == "manual_rename":
@@ -1032,6 +1140,7 @@ class AutoMeetingVideoRenamer:
                 "file_path": file_path
             }
             self._save_user_states()
+            self.update_telegram_status(f"✏️ Awaiting manual name: {os.path.basename(file_path)}")
             
             # Remove buttons and ask for new meeting name
             request_json(
@@ -1053,6 +1162,40 @@ class AutoMeetingVideoRenamer:
                 json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
             )
             self.uploader._send_telegram_notification("✅ Cancelled.")
+
+        elif cb_data["action"] == "pending_process_all":
+            # Process all pending files
+            pending_copy = self.pending_files.copy()
+            self.pending_files.clear()
+            self.update_telegram_status(f"✅ Processing {len(pending_copy)} pending file(s)...")
+            for path in pending_copy:
+                if os.path.exists(path):
+                    threading.Thread(target=self.on_video_created, args=(path,)).start()
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+
+        elif cb_data["action"] == "pending_skip_all":
+            skipped = len(self.pending_files)
+            self.pending_files.clear()
+            self.update_telegram_status(f"⏭️ Skipped {skipped} pending file(s).")
+            request_json(
+                "POST",
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json_body={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+            )
+
+        elif cb_data["action"] == "retry_upload":
+            file_path = cb_data.get("file_path")
+            if file_path:
+                self.update_telegram_status(f"🔄 Retrying upload: {os.path.basename(file_path)}")
+                threading.Thread(target=self.uploader.upload_video, args=(file_path,)).start()
+
+        elif cb_data["action"] == "show_error":
+            error_text = cb_data.get("error", "(no details)")
+            self.uploader._send_telegram_notification(f"ℹ️ Details:\n{error_text[:3500]}")
 
         elif cb_data["action"] == "assign_speaker":
             job_id = cb_data["job_id"]
@@ -1576,6 +1719,46 @@ class AutoMeetingVideoRenamer:
             self._send_recent_recordings_menu(count, chat_id=chat_id)
             return
 
+        if text.startswith("/status"):
+            queue_len = self.meeting_queue.get_queue_size() if hasattr(self.meeting_queue, "get_queue_size") else 0
+            pending_len = len(self.pending_files)
+            status = "Online" if self.internet_available else "Offline"
+            self.uploader._send_telegram_notification(
+                f"🧭 Status: {status}\n📦 Pending files: {pending_len}\n🧾 Meeting log queue: {queue_len}"
+            )
+            return
+
+        if text.startswith("/queue"):
+            pending_len = len(self.pending_files)
+            if pending_len == 0:
+                self.uploader._send_telegram_notification("📦 Pending files: 0")
+            else:
+                names = "\n".join([f"• {os.path.basename(p)}" for p in self.pending_files[:10]])
+                more = f"\n...and {pending_len - 10} more" if pending_len > 10 else ""
+                self.uploader._send_telegram_notification(f"📦 Pending files ({pending_len}):\n{names}{more}")
+            return
+
+        if text.startswith("/last"):
+            if self.last_event:
+                self.uploader._send_telegram_notification(
+                    f"🕒 Last event ({self.last_event['time']}):\n{self.last_event['text']}"
+                )
+            else:
+                self.uploader._send_telegram_notification("ℹ️ No recent events.")
+            return
+
+        if text.startswith("/help"):
+            self.uploader._send_telegram_notification(
+                "Commands:\n"
+                "/menu - Main menu\n"
+                "/status - App status\n"
+                "/queue - Pending files\n"
+                "/last - Last event\n"
+                "/recent [n] - Recent recordings\n"
+                "/stuck - Stuck files"
+            )
+            return
+
         if text.startswith("/stuck"):
             self._send_stuck_files_menu(chat_id)
             return
@@ -1788,10 +1971,23 @@ class AutoMeetingVideoRenamer:
                 filename = f"{name}_lang_{language}{ext}"
 
             dest_path = self._get_unique_destination(to_folder, filename)
-            shutil.move(file_path, dest_path)
-            self.uploader._send_telegram_notification(
-                f"✅ Moved to transcription ({language.upper() if language else 'AUTO'}): {os.path.basename(dest_path)}"
-            )
+            
+            # Retry logic for moving files (Nextcloud can lock files)
+            max_move_retries = 10
+            move_retry_delay = 2
+            for i in range(max_move_retries):
+                try:
+                    shutil.move(file_path, dest_path)
+                    self.uploader._send_telegram_notification(
+                        f"✅ Moved to transcription ({language.upper() if language else 'AUTO'}): {os.path.basename(dest_path)}"
+                    )
+                    break
+                except Exception as e:
+                    if i < max_move_retries - 1:
+                        logger.warning(f"Move attempt {i+1}/{max_move_retries} failed, retrying in {move_retry_delay}s...: {e}")
+                        time.sleep(move_retry_delay)
+                    else:
+                        raise e
         except Exception as e:
             logger.error(f"Failed to move file to transcribe folder: {e}")
             self.uploader._send_telegram_notification("❌ Failed to move file.")
@@ -1808,6 +2004,13 @@ class AutoMeetingVideoRenamer:
             ],
             [
                 {"text": "🔍 Check Stuck Files", "callback_data": "menu_stuck_files"}
+            ],
+            [
+                {"text": "🧭 Status", "callback_data": "show_status"},
+                {"text": "📦 Queue", "callback_data": "show_queue"}
+            ],
+            [
+                {"text": "🕒 Last Event", "callback_data": "show_last"}
             ]
         ]
 
@@ -1831,6 +2034,10 @@ class AutoMeetingVideoRenamer:
         try:
             commands = [
                 {"command": "menu", "description": "📂 Show main menu"},
+                {"command": "status", "description": "🧭 Show status"},
+                {"command": "queue", "description": "📦 Show pending queue"},
+                {"command": "last", "description": "🕒 Show last event"},
+                {"command": "help", "description": "ℹ️ Help"},
                 {"command": "stuck", "description": "🔍 Check stuck files"},
                 {"command": "recent", "description": "📹 Show recent recordings"},
             ]
@@ -1976,12 +2183,23 @@ class AutoMeetingVideoRenamer:
             filename = os.path.basename(file_path)
             dest_path = self._get_unique_destination(to_transcribe, filename)
             
-            shutil.move(file_path, dest_path)
-            logger.info(f"✓ Moved stuck file from Renamed to ToTranscribe: {filename}")
-            
-            if chat_id:
-                self.uploader._send_telegram_notification(f"✅ Moved to ToTranscribe: {filename}")
-            return True
+            # Retry logic for moving files (Nextcloud can lock files)
+            max_move_retries = 10
+            move_retry_delay = 2
+            for i in range(max_move_retries):
+                try:
+                    shutil.move(file_path, dest_path)
+                    logger.info(f"✓ Moved stuck file from Renamed to ToTranscribe: {filename}")
+                    
+                    if chat_id:
+                        self.uploader._send_telegram_notification(f"✅ Moved to ToTranscribe: {filename}")
+                    return True
+                except Exception as e:
+                    if i < max_move_retries - 1:
+                        logger.warning(f"Move attempt {i+1}/{max_move_retries} failed, retrying in {move_retry_delay}s...: {e}")
+                        time.sleep(move_retry_delay)
+                    else:
+                        raise e
         except Exception as e:
             logger.error(f"Failed to move stuck file: {e}")
             if chat_id:
@@ -2008,6 +2226,10 @@ class AutoMeetingVideoRenamer:
         logger.info(f"✓ {result['message']}")
         new_path = result['new_path']
 
+        self.update_telegram_status(
+            f"✅ Renamed: {os.path.basename(new_path)}\nMeeting: {result.get('meeting_title', 'Unknown')}"
+        )
+
         self._mark_processed_watch_file(new_path)
         
         # Move file to renamed_folder
@@ -2018,11 +2240,22 @@ class AutoMeetingVideoRenamer:
                 filename = os.path.basename(new_path)
                 renamed_path = os.path.join(renamed_folder, filename)
                 
-                # Move file from watch_folder to renamed_folder
+                # Move file from watch_folder to renamed_folder with retries
                 if os.path.exists(new_path):
-                    shutil.move(new_path, renamed_path)
-                    logger.info(f"✓ File moved to renamed folder: {renamed_path}")
-                    new_path = renamed_path
+                    max_move_retries = 10
+                    move_retry_delay = 2
+                    for i in range(max_move_retries):
+                        try:
+                            shutil.move(new_path, renamed_path)
+                            logger.info(f"✓ File moved to renamed folder: {renamed_path}")
+                            new_path = renamed_path
+                            break
+                        except Exception as e:
+                            if i < max_move_retries - 1:
+                                logger.warning(f"Move attempt {i+1}/{max_move_retries} failed, retrying in {move_retry_delay}s...: {e}")
+                                time.sleep(move_retry_delay)
+                            else:
+                                raise e
                 else:
                     logger.warning(f"File not found at {new_path}, skipping move to renamed folder")
             except Exception as e:
@@ -2461,7 +2694,7 @@ def main():
         try:
             # Setup logging
             log_file = os.path.join(PROJECT_ROOT, "logs", "auto_renamer.log")
-            setup_logging(log_file)
+            setup_logging(log_file, structured=True)
             
             # Install global exception handler
             sys.excepthook = global_exception_handler

@@ -292,14 +292,14 @@ class FileRenamer:
                 logger.debug(f"File size check (attempt {attempt + 1}/{check_attempts}): {current_size} bytes, last_size={last_size}")
                 
                 # Windows specific check: Try to rename the file to itself
-                # This is non-blocking - we don't fail if this fails for Nextcloud files
+                # If this fails, the file is likely locked (e.g., still recording)
                 rename_ok = True
                 if os.name == 'nt':
                     try:
                         os.rename(file_path, file_path)
-                        logger.debug(f"Windows rename check passed")
+                        logger.debug("Windows rename check passed")
                     except (IOError, OSError) as e:
-                        logger.debug(f"Windows rename check failed (Nextcloud lock?): {e}")
+                        logger.debug(f"Windows rename check failed (file locked?): {e}")
                         rename_ok = False
                 
                 # Standard check: Try to open for reading (less restrictive than appending)
@@ -327,8 +327,9 @@ class FileRenamer:
                 # File is ready if:
                 # 1. Size is stable (not currently being written to)
                 # 2. We can read it (accessible)
-                # 3. File has some content OR it's a Nextcloud file that might be legitimately empty
-                if stable_count >= required_stable_checks and append_ok and current_size >= 0:
+                # 3. Windows rename-to-self check passed (not locked)
+                # 4. File has some content OR it's a Nextcloud file that might be legitimately empty
+                if stable_count >= required_stable_checks and append_ok and current_size >= 0 and (rename_ok or os.name != 'nt'):
                     logger.info(f"✓ File is ready: {file_path} ({current_size} bytes, stable={stable_count} checks)")
                     return True
                 
@@ -365,7 +366,8 @@ class FileRenamer:
                 return True
             
             # Try to rename with retries if file is locked
-            max_retries = 5
+            # Increased retries for Nextcloud file locks (can take 30-60+ seconds)
+            max_retries = 20
             retry_delay = 2
             for i in range(max_retries):
                 try:
@@ -374,7 +376,7 @@ class FileRenamer:
                     return True
                 except (IOError, OSError) as e:
                     if i < max_retries - 1:
-                        logger.warning(f"Rename attempt {i+1} failed (file locked?), retrying in {retry_delay}s...: {e}")
+                        logger.warning(f"Rename attempt {i+1}/{max_retries} failed (file locked?), retrying in {retry_delay}s...: {e}")
                         time.sleep(retry_delay)
                     else:
                         raise e
@@ -402,6 +404,7 @@ class FileRenamer:
         Returns:
             bool: True if successful, False otherwise
         """
+        import time
         try:
             if not os.path.exists(source_path):
                 logger.error(f"Source file does not exist: {source_path}")
@@ -420,9 +423,20 @@ class FileRenamer:
                 logger.info(f"[DRY RUN] Would copy: {source_path} -> {destination_path}")
                 return True
             
-            shutil.copy2(source_path, destination_path)
-            logger.info(f"Successfully copied: {source_path} -> {destination_path}")
-            return True
+            # Try to copy with retries if file is locked
+            max_retries = 10
+            retry_delay = 2
+            for i in range(max_retries):
+                try:
+                    shutil.copy2(source_path, destination_path)
+                    logger.info(f"Successfully copied: {source_path} -> {destination_path}")
+                    return True
+                except (IOError, OSError) as e:
+                    if i < max_retries - 1:
+                        logger.warning(f"Copy attempt {i+1}/{max_retries} failed (file locked?), retrying in {retry_delay}s...: {e}")
+                        time.sleep(retry_delay)
+                    else:
+                        raise e
         
         except Exception as e:
             logger.error(f"Error copying file: {e}")
@@ -440,6 +454,7 @@ class FileRenamer:
         Returns:
             bool: True if successful, False otherwise
         """
+        import time
         try:
             if not os.path.exists(file_path):
                 logger.error(f"File does not exist: {file_path}")
@@ -449,9 +464,20 @@ class FileRenamer:
                 logger.info(f"[DRY RUN] Would delete: {file_path}")
                 return True
             
-            os.remove(file_path)
-            logger.info(f"Successfully deleted: {file_path}")
-            return True
+            # Try to delete with retries if file is locked
+            max_retries = 10
+            retry_delay = 2
+            for i in range(max_retries):
+                try:
+                    os.remove(file_path)
+                    logger.info(f"Successfully deleted: {file_path}")
+                    return True
+                except (IOError, OSError) as e:
+                    if i < max_retries - 1:
+                        logger.warning(f"Delete attempt {i+1}/{max_retries} failed (file locked?), retrying in {retry_delay}s...: {e}")
+                        time.sleep(retry_delay)
+                    else:
+                        raise e
         
         except Exception as e:
             logger.error(f"Error deleting file: {e}")

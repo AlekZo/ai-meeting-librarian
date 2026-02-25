@@ -9,6 +9,8 @@ import logging
 import os
 from typing import Any, Dict, List
 
+from storage_utils import locked_load_json, locked_save_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,19 +20,11 @@ class MeetingLogQueue:
         os.makedirs(os.path.dirname(queue_file), exist_ok=True)
 
     def _load(self) -> List[Dict[str, Any]]:
-        if not os.path.exists(self.queue_file):
-            return []
-        try:
-            with open(self.queue_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load queue: {e}")
-            return []
+        return locked_load_json(self.queue_file, [])
 
     def _save(self, items: List[Dict[str, Any]]) -> None:
         try:
-            with open(self.queue_file, "w", encoding="utf-8") as f:
-                json.dump(items, f, indent=2, ensure_ascii=False)
+            locked_save_json(self.queue_file, items, indent=2, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Failed to save queue: {e}")
 

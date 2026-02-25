@@ -2,12 +2,41 @@
 Logging configuration module
 """
 
+import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
-def setup_logging(log_file="logs/auto_renamer.log", level=logging.INFO):
+
+class JsonLogFormatter(logging.Formatter):
+    """JSON formatter for structured logs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "line": record.lineno,
+            "process": record.process,
+            "thread": record.thread,
+        }
+
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(payload, ensure_ascii=False)
+
+def setup_logging(
+    log_file="logs/auto_renamer.log",
+    level=logging.INFO,
+    max_bytes=10 * 1024 * 1024,
+    backup_count=5,
+    structured=True,
+):
     """
     Configure logging for the application with rotation
     
@@ -28,16 +57,19 @@ def setup_logging(log_file="logs/auto_renamer.log", level=logging.INFO):
     if root_logger.handlers:
         root_logger.handlers.clear()
     
-    # Rotating File handler (10MB per file, keep 5 backups)
+    # Rotating File handler
     try:
         file_handler = RotatingFileHandler(
-            log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding='utf-8'
         )
         file_handler.setLevel(level)
-        file_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        if structured:
+            file_formatter = JsonLogFormatter()
+        else:
+            file_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
     except Exception as e:

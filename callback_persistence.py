@@ -7,6 +7,8 @@ import logging
 import os
 from typing import Any, Dict
 
+from storage_utils import locked_load_json, locked_save_json
+
 logger = logging.getLogger(__name__)
 
 class CallbackPersistence:
@@ -16,20 +18,12 @@ class CallbackPersistence:
 
     def load(self) -> Dict[str, Any]:
         """Load the callback map from disk"""
-        if not os.path.exists(self.storage_file):
-            return {}
-        try:
-            with open(self.storage_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load callback map: {e}")
-            return {}
+        return locked_load_json(self.storage_file, {})
 
     def save(self, callback_map: Dict[str, Any]) -> None:
         """Save the callback map to disk"""
         try:
-            with open(self.storage_file, "w", encoding="utf-8") as f:
-                json.dump(callback_map, f, indent=2, ensure_ascii=False)
+            locked_save_json(self.storage_file, callback_map, indent=2, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Failed to save callback map: {e}")
 

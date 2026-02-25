@@ -174,6 +174,43 @@ class GoogleCalendarHandler:
             logger.error(f"Error querying Google Calendar: {e}")
             return None
     
+    @staticmethod
+    def _filter_active_meetings(events, check_time):
+        """Filter events to those active at check_time."""
+        from dateutil import parser
+        from datetime import timezone
+
+        active_meetings = []
+
+        for event in events:
+            summary = event.get('summary', 'No Title')
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end = event['end'].get('dateTime', event['end'].get('date'))
+
+            logger.debug(f"Checking event: '{summary}' ({start} to {end})")
+
+            start_dt = parser.parse(start)
+            end_dt = parser.parse(end)
+
+            # Ensure check_time is timezone-aware for proper comparison
+            if start_dt.tzinfo and not check_time.tzinfo:
+                check_time_aware = check_time.replace(tzinfo=timezone.utc)
+                logger.debug(f"Converted naive check_time to UTC-aware: {check_time_aware}")
+            else:
+                check_time_aware = check_time
+
+            if start_dt <= check_time_aware <= end_dt:
+                logger.debug(
+                    f"MATCH: Event '{summary}' ({start_dt} to {end_dt}) is active at {check_time_aware}"
+                )
+                active_meetings.append(event)
+            else:
+                logger.debug(
+                    f"NO MATCH: Event '{summary}' ({start_dt} to {end_dt}) is NOT active at {check_time_aware}"
+                )
+
+        return active_meetings
+
     def get_meetings_at_time(self, check_time, retry_attempts=3, retry_delay=2):
         """
         Get all meetings that are active at a specific time
@@ -218,45 +255,7 @@ class GoogleCalendarHandler:
                 logger.debug(f"API returned {len(events)} events")
                 
                 # Filter events to find those that actually overlap with check_time
-                active_meetings = []
-                for event in events:
-                    summary = event.get('summary', 'No Title')
-                    start = event['start'].get('dateTime', event['start'].get('date'))
-                    end = event['end'].get('dateTime', event['end'].get('date'))
-                    
-                    logger.debug(f"Checking event: '{summary}' ({start} to {end})")
-                    
-                    # Convert to datetime objects for comparison
-                    from dateutil import parser
-                    start_dt = parser.parse(start)
-                    end_dt = parser.parse(end)
-                    
-                    # Check if check_time is between start and end
-                    # We need to handle timezone-aware vs naive datetimes
-                    is_active = False
-                    
-                    # Ensure check_time is timezone-aware for proper comparison
-                    if start_dt.tzinfo and not check_time.tzinfo:
-                        # check_time is naive, start_dt is aware
-                        # Assume check_time is in UTC (since it comes from file timestamp converted to UTC)
-                        from datetime import timezone
-                        check_time_aware = check_time.replace(tzinfo=timezone.utc)
-                        logger.debug(f"Converted naive check_time to UTC-aware: {check_time_aware}")
-                    elif start_dt.tzinfo and check_time.tzinfo:
-                        # Both are aware, use as-is
-                        check_time_aware = check_time
-                    else:
-                        # Both are naive
-                        check_time_aware = check_time
-                    
-                    if start_dt <= check_time_aware <= end_dt:
-                        is_active = True
-                    
-                    if is_active:
-                        logger.debug(f"MATCH: Event '{summary}' ({start_dt} to {end_dt}) is active at {check_time_aware}")
-                        active_meetings.append(event)
-                    else:
-                        logger.debug(f"NO MATCH: Event '{summary}' ({start_dt} to {end_dt}) is NOT active at {check_time_aware}")
+                active_meetings = self._filter_active_meetings(events, check_time)
                 
                 if active_meetings:
                     logger.info(f"Found {len(active_meetings)} active meetings at {check_time}")

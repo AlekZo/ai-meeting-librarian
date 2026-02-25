@@ -9,6 +9,7 @@ from pathlib import Path
 from http_client import request_json, request_text
 
 logger = logging.getLogger(__name__)
+from storage_utils import locked_load_json, locked_save_json
 
 class VideoUploader:
     def __init__(self, config):
@@ -110,6 +111,7 @@ class VideoUploader:
                 logger.info(f"Successfully uploaded {file_name}")
                 cb_id = f"cancel_{int(time.time())}"
                 # Store in config or pass back to main to handle cancellation
+                self._update_telegram_status(f"📤 Uploaded: {file_name}")
                 self._send_telegram_notification(
                     f"📤 Uploaded: {file_name}",
                     reply_markup={"inline_keyboard": [[{"text": "🛑 Cancel Processing", "callback_data": cb_id}]]}
@@ -135,7 +137,20 @@ class VideoUploader:
                         self.start_transcription(job_id, file_path)
             else:
                 logger.error(f"Failed to upload {file_name}. Status: {response.status_code}")
-                self._send_telegram_notification(f"❌ Upload failed: {file_name}")
+                error_text = response_data if isinstance(response_data, str) else json.dumps(response_data) if response_data else "Unknown error"
+                retry_cb_id = f"retry_up_{int(time.time())}"
+                show_cb_id = f"show_up_{int(time.time())}"
+                if hasattr(self, 'main_app'):
+                    self.main_app.callback_map[retry_cb_id] = {"action": "retry_upload", "file_path": file_path}
+                    self.main_app.callback_map[show_cb_id] = {"action": "show_error", "error": error_text}
+                    self.main_app.callback_persistence.save(self.main_app.callback_map)
+                self._send_telegram_notification(
+                    f"❌ Upload failed: {file_name}",
+                    reply_markup={"inline_keyboard": [[
+                        {"text": "🔄 Retry Upload", "callback_data": retry_cb_id},
+                        {"text": "ℹ️ Show Details", "callback_data": show_cb_id}
+                    ]]}
+                )
         except Exception as e:
             logger.error(f"Error during upload of {file_name}: {str(e)}")
             self._save_log(file_path, "ERROR", str(e))
@@ -259,6 +274,9 @@ class VideoUploader:
                     self.main_app.callback_map[cb_id] = {"action": "cancel", "job_id": job_id, "file_path": original_file_path}
                     self.main_app.callback_persistence.save(self.main_app.callback_map)
                 
+                self._update_telegram_status(
+                    f"🎙️ Transcription started ({device}): {os.path.basename(original_file_path)}"
+                )
                 self._send_telegram_notification(
                     f"🎙️ Transcription started ({device}): {os.path.basename(original_file_path)}",
                     reply_markup={"inline_keyboard": [[{"text": "🛑 Stop Transcription", "callback_data": cb_id}]]}
@@ -304,6 +322,9 @@ class VideoUploader:
                             stats_text = f"\n⚙️ {stats['device'].upper()} | {stats['params']} | ⏱️ {time_str}"
                             del self.job_stats[job_id]
 
+                        self._update_telegram_status(
+                            f"✅ Transcription completed: {os.path.basename(original_file_path)}"
+                        )
                         self._send_telegram_notification(
                             f"✅ Transcription completed: {os.path.basename(original_file_path)}{stats_text}\n🔗 View on Scriberr: {scriberr_link}"
                         )
@@ -338,9 +359,19 @@ class VideoUploader:
                             }
                             self.main_app.callback_persistence.save(self.main_app.callback_map)
 
+                        show_cb_id = f"show_tx_{int(time.time())}"
+                        if hasattr(self, 'main_app'):
+                            self.main_app.callback_map[show_cb_id] = {
+                                "action": "show_error",
+                                "error": error_msg
+                            }
+                            self.main_app.callback_persistence.save(self.main_app.callback_map)
                         self._send_telegram_notification(
                             f"❌ Transcription failed: {os.path.basename(original_file_path)}\nError: {error_msg[:100]}...",
-                            reply_markup={"inline_keyboard": [[{"text": "🔄 Retry Transcription", "callback_data": retry_cb_id}]]}
+                            reply_markup={"inline_keyboard": [[
+                                {"text": "🔄 Retry Transcription", "callback_data": retry_cb_id},
+                                {"text": "ℹ️ Show Details", "callback_data": show_cb_id}
+                            ]]}
                         )
                         self._append_to_log(original_file_path, "TRANSCRIPTION_FAILED", 200, data)
                         break
@@ -957,10 +988,21 @@ Format:
             response, payload = request_json("POST", url, json_body=payload, timeout=10)
             if response and response.status_code != 200:
                 logger.error(f"Telegram API error: {response.status_code} - {response.text}")
-            return payload
+                return None
+            if payload and isinstance(payload, dict):
+                return payload.get("result", {}).get("message_id")
+            return None
         except Exception as e:
             logger.error(f"Failed to send telegram notification: {str(e)}")
             return None
+
+    def _update_telegram_status(self, message):
+        """Update the global Telegram status message via main_app if available."""
+        if hasattr(self, "main_app") and self.main_app:
+            try:
+                self.main_app.update_telegram_status(message)
+            except Exception:
+                pass
 
     def _update_scriberr_speakers(self, job_id, speaker_map):
         url = f"{self.base_url}/api/v1/transcription/{job_id}/speakers"
@@ -1102,11 +1144,9 @@ Format:
             log_path = file_path_obj.parent / f"{file_path_obj.name}_upload.log"
             log_data = {}
             if log_path.exists():
-                with open(log_path, 'r', encoding='utf-8') as f:
-                    log_data = json.load(f)
+                log_data = locked_load_json(str(log_path), {})
             log_data[action] = {"status": status, "response": response_content, "timestamp": str(time.time())}
-            with open(log_path, 'w', encoding='utf-8') as f:
-                json.dump(log_data, f, indent=4, ensure_ascii=False)
+            locked_save_json(str(log_path), log_data, indent=4, ensure_ascii=False)
         except Exception: pass
 
     def _save_log(self, file_path, status, response_content):
@@ -1115,8 +1155,7 @@ Format:
             file_path_obj = Path(file_path)
             log_path = file_path_obj.parent / f"{file_path_obj.name}_upload.log"
             log_data = {"file_name": file_path_obj.name, "status": status, "response": response_content}
-            with open(log_path, 'w', encoding='utf-8') as f:
-                json.dump(log_data, f, indent=4, ensure_ascii=False)
+            locked_save_json(str(log_path), log_data, indent=4, ensure_ascii=False)
         except Exception: pass
 
     def _get_model_info(self, model_family, model_name):
