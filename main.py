@@ -35,12 +35,14 @@ from google_calendar_handler import GoogleCalendarHandler
 from file_monitor import FileMonitor
 from file_renamer import FileRenamer
 from video_uploader import VideoUploader
-from http_client import request_json, request_text
+from http_client import request_json, request_text, set_resilience_settings
 from sheets_drive_handler import SheetsDriveHandler
 from meeting_log_queue import MeetingLogQueue
 from callback_persistence import CallbackPersistence
 from system_tray import SystemTrayIcon
 from storage_utils import locked_load_json, locked_save_json
+from resilience_utils import get_health_checker, get_circuit_breaker
+from state_recovery import AppState, StateMonitor, enable_auto_restart
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,20 @@ class AutoMeetingVideoRenamer:
         if setproctitle:
             setproctitle("AutoMeetingVideoRenamer")
         self.config = config
+        
+        # Initialize state recovery
+        self.app_state = AppState()
+        self.app_state.mark_startup()
+        self.state_monitor = StateMonitor(self.app_state)
+        
+        # Check if we should enter recovery mode
+        if self.app_state.should_enter_recovery_mode():
+            logger.warning("⚠️ ENTERING CRASH RECOVERY MODE")
+            logger.warning("   Application seems unstable. Running in minimal mode.")
+            self.recovery_mode = True
+        else:
+            self.recovery_mode = False
+        
         self.monitor = None  # Monitor for watch_folder (renaming)
         self.transcribe_monitor = None  # Monitor for to_transcribe_folder (transcription)
         self.calendar = None
@@ -91,6 +107,13 @@ class AutoMeetingVideoRenamer:
         )
         self.meeting_queue = MeetingLogQueue()
         self._cb_counter = int(time.time()) % 100000
+        
+        # Configure HTTP client resilience
+        set_resilience_settings(
+            max_retries=3,
+            connection_timeout=10,
+            read_timeout=30
+        )
 
     def _gen_cb_id(self, prefix="cb"):
         """Generate a unique callback ID to avoid collisions"""
@@ -158,12 +181,19 @@ class AutoMeetingVideoRenamer:
         logger.info("Auto-Meeting Video Renamer - Initializing")
         logger.info("=" * 50)
         
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+        if hasattr(signal, 'SIGBREAK'):  # Windows
+            signal.signal(signal.SIGBREAK, self._handle_signal)
+        
         # Validate configuration
         try:
             self.config.validate()
             logger.info("Configuration validated successfully")
         except ValueError as e:
             logger.error(f"Configuration error: {e}")
+            self.app_state.record_error(str(e))
             return False
         
         # Ensure all required folders exist
@@ -181,6 +211,7 @@ class AutoMeetingVideoRenamer:
                     logger.info(f"Ensured folder exists: {folder}")
         except Exception as e:
             logger.error(f"Failed to create required folders: {e}")
+            self.app_state.record_error(str(e))
             return False
         
         # Initialize file monitor for watch_folder (renaming)
@@ -192,8 +223,10 @@ class AutoMeetingVideoRenamer:
             logger.info(f"File monitor started for watch_folder: {watch_folder}")
         except Exception as e:
             logger.error(f"Failed to start file monitor: {e}")
-            return False
-        
+            self.app_state.record_error(f"File monitor failed: {str(e)}")
+            if not self.recovery_mode:  # In recovery mode, continue anyway
+                return False
+
         # Initialize file monitor for to_transcribe_folder
         try:
             to_transcribe_folder = self.config.get("to_transcribe_folder")
@@ -202,7 +235,9 @@ class AutoMeetingVideoRenamer:
             logger.info(f"File monitor started for to_transcribe_folder: {to_transcribe_folder}")
         except Exception as e:
             logger.error(f"Failed to start transcribe monitor: {e}")
-            return False
+            self.app_state.record_error(f"Transcribe monitor failed: {str(e)}")
+            if not self.recovery_mode:
+                return False
 
         # Start Google Auth and Sheets initialization in background
         threading.Thread(target=self._bg_initialize_cloud_services, daemon=True).start()
@@ -211,6 +246,11 @@ class AutoMeetingVideoRenamer:
         self._setup_telegram_menu()
         
         return True
+    
+    def _handle_signal(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
+        self.shutdown(graceful=True)
 
     def _bg_initialize_cloud_services(self):
         """Background thread for internet-dependent services"""
@@ -339,20 +379,30 @@ class AutoMeetingVideoRenamer:
     def on_video_for_transcription(self, file_path):
         """
         Callback when a new video file is created in to_transcribe_folder
-        Handles: Uploading to transcription service and processing
-        
-        Args:
-            file_path: Path to the video file ready for transcription
         """
         logger.info(f"[TO_TRANSCRIBE_FOLDER] Processing video file for transcription: {file_path}")
+
+        # Skip if file is already being handled to prevent loops
+        if file_path in self.files_pending_user_action:
+            return
 
         if not self._is_file_ready(file_path):
             return
 
-        # Skip if already processed (prevents infinite loops)
-        if self._is_already_processed_transcribe_file(file_path):
-            logger.debug(f"File already processed (same size/mtime), skipping: {file_path}")
-            return
+        # Mark as active to prevent re-entry from watchdog during slow processing
+        self.files_pending_user_action.add(file_path)
+        
+        try:
+            # Skip if already processed (prevents infinite loops)
+            if self._is_already_processed_transcribe_file(file_path):
+                logger.debug(f"File already processed (same size/mtime), skipping: {file_path}")
+                return
+            
+            # ... existing code ...
+        finally:
+            # Only remove if we didn't successfully upload/move it
+            if file_path in self.files_pending_user_action and not self._is_already_processed_transcribe_file(file_path):
+                self.files_pending_user_action.discard(file_path)
 
         if self._queue_if_offline(file_path):
             return
@@ -1465,6 +1515,7 @@ class AutoMeetingVideoRenamer:
         
         if not self.initialize():
             logger.error("Failed to initialize application")
+            self.app_state.record_error("Initialization failed")
             return False
         
         try:
@@ -1473,6 +1524,16 @@ class AutoMeetingVideoRenamer:
 
             # Flush any queued meeting logs on startup
             self.flush_meeting_queue()
+            
+            # Restore pending files from previous crash
+            rescued_files = self.app_state.get_pending_files()
+            if rescued_files:
+                logger.info(f"🔄 Restoring {len(rescued_files)} pending files from previous session")
+                self.pending_files.extend(rescued_files)
+                self.app_state.set_pending_files([])  # Clear after restoring
+            
+            # Mark initialization as complete
+            self.app_state.mark_initialization_complete()
             
             # Start internet monitoring in a separate thread
             import threading
@@ -1489,8 +1550,17 @@ class AutoMeetingVideoRenamer:
             )
             telegram_thread.start()
             
+            # Start health monitor
+            health_monitor_thread = threading.Thread(
+                target=self._monitor_health,
+                daemon=True
+            )
+            health_monitor_thread.start()
+            
             logger.info("=" * 60)
             logger.info("Auto-Meeting Video Renamer is running...")
+            if self.recovery_mode:
+                logger.warning("⚠️ Running in RECOVERY MODE - limited functionality")
             logger.info("=" * 60)
             logger.info(f"📁 Watch folder (renaming): {self.config.get('watch_folder')}")
             logger.info(f"📁 Transcribe folder: {self.config.get('to_transcribe_folder')}")
@@ -1503,11 +1573,30 @@ class AutoMeetingVideoRenamer:
                 # Check if critical threads are still alive
                 if not internet_monitor_thread.is_alive():
                     logger.error("CRITICAL: Internet monitor thread died!")
-                    raise RuntimeError("Internet monitor thread died")
+                    self.app_state.record_error("Internet monitor thread died")
+                    if not self.recovery_mode:
+                        raise RuntimeError("Internet monitor thread died")
+                    else:
+                        # In recovery mode, restart the thread
+                        logger.warning("⚠️ Restarting internet monitor thread...")
+                        internet_monitor_thread = threading.Thread(
+                            target=self.monitor_internet_connection,
+                            daemon=True
+                        )
+                        internet_monitor_thread.start()
                 
                 if not telegram_thread.is_alive():
                     logger.error("CRITICAL: Telegram update thread died!")
-                    raise RuntimeError("Telegram update thread died")
+                    self.app_state.record_error("Telegram thread died")
+                    if not self.recovery_mode:
+                        raise RuntimeError("Telegram update thread died")
+                    else:
+                        logger.warning("⚠️ Restarting Telegram thread...")
+                        telegram_thread = threading.Thread(
+                            target=self._handle_telegram_updates,
+                            daemon=True
+                        )
+                        telegram_thread.start()
 
                 time.sleep(5)
         
@@ -1515,28 +1604,70 @@ class AutoMeetingVideoRenamer:
             logger.info("Received interrupt signal, shutting down...")
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+            self.app_state.record_error(f"Main loop error: {str(e)}")
             raise # Re-raise to trigger auto-restart in main()
         finally:
-            self.shutdown()
+            self.shutdown(graceful=False)
         
         return True
     
-    def shutdown(self):
+    def _monitor_health(self):
+        """Monitor application health and report issues"""
+        check_interval = 300  # Check every 5 minutes
+        
+        while self.running:
+            try:
+                health = self.state_monitor.check_health()
+                
+                if not health["is_healthy"]:
+                    logger.error(f"⚠️ HEALTH CHECK FAILED: {health['errors']}")
+                    for error in health["errors"]:
+                        self.app_state.record_error(error)
+                        self.uploader._send_telegram_notification(f"⚠️ Health issue: {error}")
+                
+                if health["warnings"]:
+                    logger.warning(f"Health warnings: {health['warnings']}")
+                
+                time.sleep(check_interval)
+            except Exception as e:
+                logger.error(f"Error in health monitor: {e}")
+                time.sleep(10)
+    
+    def shutdown(self, graceful=False):
         """Shutdown the application"""
         logger.info("Shutting down application...")
         
         if self.monitor:
-            self.monitor.stop()
-            logger.info("✓ Watch folder monitor stopped")
+            try:
+                self.monitor.stop()
+                logger.info("✓ Watch folder monitor stopped")
+            except Exception as e:
+                logger.error(f"Error stopping watch monitor: {e}")
         
         if self.transcribe_monitor:
-            self.transcribe_monitor.stop()
-            logger.info("✓ Transcribe folder monitor stopped")
+            try:
+                self.transcribe_monitor.stop()
+                logger.info("✓ Transcribe folder monitor stopped")
+            except Exception as e:
+                logger.error(f"Error stopping transcribe monitor: {e}")
         
         if self.calendar:
-            self.calendar.close()
+            try:
+                self.calendar.close()
+            except Exception as e:
+                logger.error(f"Error closing calendar: {e}")
         
         self.running = False
+        
+        # Save state before shutdown
+        if graceful:
+            self.app_state.mark_shutdown()
+            logger.info("✓ Application state saved for graceful shutdown")
+        else:
+            # Save pending files for recovery
+            self.app_state.set_pending_files(self.pending_files)
+            logger.info(f"✓ Saved {len(self.pending_files)} pending files for recovery")
+        
         logger.info("Application shutdown complete")
     
     def run_telegram_bot(self):

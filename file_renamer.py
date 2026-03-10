@@ -261,7 +261,8 @@ class FileRenamer:
         return str(new_filepath)
     
     @staticmethod
-    def is_file_ready(file_path, check_delay=3, check_attempts=10):
+    @staticmethod
+    def is_file_ready(file_path, check_delay=3, check_attempts=15):
         """
         Check if a file is ready to be renamed (not being written to)
         Optimized for Nextcloud-synced files
@@ -279,7 +280,7 @@ class FileRenamer:
         
         last_size = -1
         stable_count = 0
-        required_stable_checks = 2  # Require 2 consecutive size checks to be stable
+        required_stable_checks = 3  # Increased for Nextcloud stability
         
         for attempt in range(check_attempts):
             try:
@@ -302,42 +303,19 @@ class FileRenamer:
                         logger.debug(f"Windows rename check failed (file locked?): {e}")
                         rename_ok = False
                 
-                # Standard check: Try to open for reading (less restrictive than appending)
-                # This checks if file is accessible without modifying it
-                append_ok = True
-                try:
-                    with open(file_path, 'rb') as f:
-                        # Try to read a small amount to verify accessibility
-                        f.read(1)
-                    logger.debug(f"File read check passed")
-                except (IOError, OSError) as e:
-                    logger.debug(f"File read check failed (still being written?): {e}")
-                    append_ok = False
-                
-                # Size stability check
-                if current_size == last_size:
+                if rename_ok and current_size == last_size and current_size > 0:
                     stable_count += 1
-                    logger.debug(f"Size stable: {current_size} bytes (stable_count={stable_count}/{required_stable_checks})")
+                    if stable_count >= required_stable_checks:
+                        logger.info(f"✓ File is ready: {file_path} ({current_size} bytes, stable={stable_count} checks)")
+                        return True
                 else:
                     stable_count = 0
-                    logger.debug(f"Size changed: {last_size} -> {current_size} bytes (resetting stable count)")
-                
                 last_size = current_size
-                
-                # File is ready if:
-                # 1. Size is stable (not currently being written to)
-                # 2. We can read it (accessible)
-                # 3. Windows rename-to-self check passed (not locked)
-                # 4. File has some content OR it's a Nextcloud file that might be legitimately empty
-                if stable_count >= required_stable_checks and append_ok and current_size >= 0 and (rename_ok or os.name != 'nt'):
-                    logger.info(f"✓ File is ready: {file_path} ({current_size} bytes, stable={stable_count} checks)")
-                    return True
-                
-                time.sleep(check_delay)
-            
             except Exception as e:
-                logger.debug(f"Unexpected error in readiness check (attempt {attempt + 1}/{check_attempts}): {e}")
-                time.sleep(check_delay)
+                logger.debug(f"Error checking file readiness: {e}")
+                stable_count = 0
+            
+            time.sleep(check_delay)
         
         logger.warning(f"File did not become ready after {check_attempts} attempts ({check_attempts * check_delay}s total): {file_path}")
         return False

@@ -99,7 +99,7 @@ class VideoUploader:
                     if meeting_info and meeting_info.get('language'):
                         files['language'] = (None, meeting_info['language'])
 
-                response, response_data = request_json("POST", url, headers=headers, files=files)
+                response, response_data = request_json("POST", url, headers=headers, files=files, timeout=600)
                 if not response:
                     self._save_log(file_path, "ERROR", "Upload failed")
                     return
